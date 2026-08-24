@@ -187,6 +187,22 @@ async function expectBoardRange(page: Page, lower: number, upper: number) {
   await expect(board).toHaveAttribute('data-candidate-max', String(upper))
 }
 
+test('local mode starts without contacting the configured Supabase boundary', async ({ page }) => {
+  let supabaseRequestCount = 0
+  page.on('request', (request) => {
+    const url = new URL(request.url())
+    if (/\/(?:auth|rest|realtime)\/v1(?:\/|$)/u.test(url.pathname)) {
+      supabaseRequestCount += 1
+    }
+  })
+
+  await page.goto('/')
+  await enterLocalMode(page)
+  await page.getByRole('button', { name: 'BẮT ĐẦU' }).click()
+  await expect(page.getByTestId('number-board')).toBeVisible()
+  expect(supabaseRequestCount).toBe(0)
+})
+
 test('completes a two-player game and records the loser', async ({ page }) => {
   await startGame(page)
   await expect(page.getByTestId('current-player')).toHaveText('Player 1')

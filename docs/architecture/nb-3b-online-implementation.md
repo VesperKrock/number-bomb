@@ -100,7 +100,16 @@ This is the caller's safe room-player UUID, not `auth.uid()`. It does not expose
 - Playwright uses isolated browser contexts for create/join/lobby sync, 2-player SAFE/BOOM/reconnect/replay, 4-player turn restrictions/rotation, Cron SELF_DESTRUCT after reload, provisional selection, synchronized result-onset target, mobile overflow, reduced motion and victim/spectator audio/haptics.
 - Existing local hot-seat Playwright tests remain part of the full suite.
 
-Final gate counts and viewport inspection are recorded in the completion handoff after the final clean run.
+Final clean run on 2026-08-25:
+
+- `npm run typecheck`: PASS.
+- `npm run lint`: PASS with no warnings.
+- `npm run test:unit`: 80/80 PASS across 14 files.
+- `npm run test:db`: 85/85 pgTAP assertions PASS across 3 files.
+- `npx supabase db lint --local --level error`: no schema errors.
+- `npm run test:e2e`: 32/32 Playwright tests PASS, including all accepted local regression tests.
+- `npm run build`: PASS; Online remains a separate lazy chunk.
+- Repeatable visual QA: PASS at 1440×900, 1366×768, 390×844 and 440×956; no horizontal overflow, mobile number-field-only scrolling, reachable dock, desktop viewport fit and reduced-motion result checked. The existing local visual suite also completed successfully.
 
 ## Hosted project handoff
 
