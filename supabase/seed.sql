@@ -1,0 +1,1 @@
+-- Intentionally empty. Online integration tests create isolated fixtures.
