@@ -10,6 +10,7 @@ const browser = await chromium.launch()
 
 async function startGame(page) {
   await page.goto(baseUrl)
+  await page.getByRole('button', { name: 'CHƠI CÙNG NHAU' }).click()
   await page.getByRole('button', { name: 'BẮT ĐẦU' }).click()
   await page.getByTestId('number-board').waitFor()
   await page.mouse.move(0, 0)
@@ -102,6 +103,7 @@ async function playToCritical(page) {
 try {
   const mobile390 = await browser.newPage({ viewport: { width: 390, height: 844 } })
   await mobile390.goto(baseUrl)
+  await mobile390.getByRole('button', { name: 'CHƠI CÙNG NHAU' }).click()
   await mobile390.screenshot({ path: `${outputDirectory}/mobile-390-setup.png`, fullPage: true })
   await mobile390.getByRole('button', { name: 'BẮT ĐẦU' }).click()
   await mobile390.getByTestId('number-board').waitFor()

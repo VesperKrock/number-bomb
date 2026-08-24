@@ -20,6 +20,30 @@ export type CanonicalVersionSignal =
   | { kind: 'GAME_VERSION'; version: number }
   | { kind: 'RESET' }
 
+export function shouldApplyCanonicalSnapshot(
+  current: OnlineRpcResult | null,
+  incoming: OnlineRpcResult,
+): boolean {
+  if (!current?.room) return true
+  if (!incoming.room) return incoming.code !== 'ONLINE_UNAVAILABLE'
+  if (incoming.room.id !== current.room.id) return true
+
+  if (incoming.room.version !== current.room.version) {
+    return incoming.room.version > current.room.version
+  }
+
+  if (
+    current.game
+    && incoming.game
+    && current.game.id === incoming.game.id
+    && incoming.game.version < current.game.version
+  ) {
+    return false
+  }
+
+  return true
+}
+
 export function reduceCanonicalVersion(
   state: CanonicalOnlineState,
   signal: CanonicalVersionSignal,

@@ -10,6 +10,7 @@ const browser = await chromium.launch()
 
 async function startDefaultGame(page) {
   await page.goto(baseUrl)
+  await page.getByRole('button', { name: 'CHƠI CÙNG NHAU' }).click()
   await page.getByRole('button', { name: 'BẮT ĐẦU' }).click()
   await page.getByTestId('number-board').waitFor()
 }
@@ -120,6 +121,7 @@ async function captureState(page, name, expectedCount, expectedRange, options = 
 try {
   const wide = await browser.newPage({ viewport: { width: 1440, height: 900 } })
   await wide.goto(baseUrl)
+  await wide.getByRole('button', { name: 'CHƠI CÙNG NHAU' }).click()
   await wide.screenshot({ path: `${outputDirectory}/desktop-wide-setup.png`, fullPage: true })
   await wide.getByRole('button', { name: 'BẮT ĐẦU' }).click()
   await wide.getByTestId('number-board').waitFor()
@@ -189,6 +191,7 @@ try {
 
   const mobile = await browser.newPage({ viewport: { width: 390, height: 844 } })
   await mobile.goto(baseUrl)
+  await mobile.getByRole('button', { name: 'CHƠI CÙNG NHAU' }).click()
   await mobile.screenshot({ path: `${outputDirectory}/mobile-setup.png`, fullPage: true })
   await mobile.getByRole('button', { name: 'BẮT ĐẦU' }).click()
   await mobile.getByTestId('number-board').waitFor()

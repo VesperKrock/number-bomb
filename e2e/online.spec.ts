@@ -125,6 +125,33 @@ function setLocalBomb(roomCode: string, bombNumber: number) {
   ])
 }
 
+function expireLocalTurn(roomCode: string) {
+  if (!/^[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{5}$/u.test(roomCode)) {
+    throw new Error('Unsafe room code in local E2E helper.')
+  }
+  const sql = [
+    'update public.room_games as game',
+    "set turn_deadline_at = clock_timestamp() - interval '1 millisecond'",
+    'from public.rooms as room',
+    'where room.id = game.room_id',
+    `and room.code = '${roomCode}'`,
+    "and game.phase = 'PLAYING_TURN';",
+  ].join(' ')
+  execFileSync('docker', [
+    'exec',
+    'supabase_db_number-bomb',
+    'psql',
+    '-U',
+    'postgres',
+    '-d',
+    'postgres',
+    '-v',
+    'ON_ERROR_STOP=1',
+    '-c',
+    sql,
+  ])
+}
+
 async function createOnlinePage(context: BrowserContext): Promise<Page> {
   const page = await context.newPage()
   await installHapticsMock(page)
@@ -168,13 +195,15 @@ test('two isolated devices synchronize lobby, SAFE, reconnect, and victim/specta
   setLocalBomb(roomCode, 81)
 
   await expect(peer.getByRole('button', { name: 'Chọn số 25' })).toBeDisabled()
-  await host.getByRole('button', { name: 'Chọn số 25' }).click()
+  await host.getByRole('button', { name: 'Chọn số 25' }).focus()
+  await host.keyboard.press('Enter')
   await expect(peer.getByText('Thiên An đang chọn số 25')).toBeVisible()
   await Promise.all([
     observeResultOnset(host, '.resolution-overlay--safe'),
     observeResultOnset(peer, '.resolution-overlay--safe'),
   ])
-  await host.getByRole('button', { name: 'KHÓA SỐ' }).click()
+  await host.getByRole('button', { name: 'KHÓA SỐ' }).focus()
+  await host.keyboard.press('Enter')
 
   await expect(host.getByRole('heading', { name: 'AN TOÀN' })).toBeAttached()
   await expect(peer.getByRole('heading', { name: 'AN TOÀN' })).toBeAttached()
@@ -267,4 +296,35 @@ test('four isolated devices keep canonical turn restrictions and seat rotation',
 
   await expect(host.getByTestId('online-current-player')).toHaveText('P1 Host')
   await Promise.all(contexts.map((context) => context.close()))
+})
+
+test('Cron synchronizes SELF_DESTRUCT copy after a deadline reload', async ({ browser }) => {
+  test.setTimeout(30_000)
+  const hostContext = await browser.newContext()
+  const peerContext = await browser.newContext()
+  const host = await createOnlinePage(hostContext)
+
+  await host.getByLabel('BIỆT DANH').fill('Deadline Host')
+  await host.getByLabel('KHI HẾT GIỜ').selectOption('SELF_DESTRUCT')
+  await host.getByRole('button', { name: 'TẠO PHÒNG', exact: true }).last().click()
+  const roomCode = (await host.locator('.room-share-card strong').textContent())?.trim() ?? ''
+
+  const peer = await peerContext.newPage()
+  await peer.goto(`/?room=${roomCode}`)
+  await peer.getByLabel('BIỆT DANH').fill('Deadline Peer')
+  await peer.getByRole('button', { name: 'THAM GIA PHÒNG' }).click()
+  await expect(host.getByTestId('online-roster-player')).toHaveCount(2)
+  await host.getByRole('button', { name: 'BẮT ĐẦU ONLINE' }).click()
+  await expect(peer.getByTestId('number-board')).toBeVisible()
+
+  expireLocalTurn(roomCode)
+  await host.reload()
+
+  await expect(host.getByTestId('online-boom-result')).toHaveAttribute('data-impact-profile', 'victim')
+  await expect(peer.getByTestId('online-boom-result')).toHaveAttribute('data-impact-profile', 'spectator')
+  await expect(host.getByTestId('online-boom-result')).toContainText('Deadline Host đã để thời gian cạn kiệt.')
+  await expect(peer.getByTestId('online-boom-result')).not.toContainText('đã kích nổ quả bom')
+
+  await hostContext.close()
+  await peerContext.close()
 })

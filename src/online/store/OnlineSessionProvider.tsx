@@ -31,6 +31,7 @@ import {
   type OnlineSessionValue,
   type RemoteSelection,
 } from './OnlineSessionContext'
+import { shouldApplyCanonicalSnapshot } from './versionReducer'
 
 const TERMINAL_POINTER_CODES = new Set<OnlineRpcResult['code']>([
   'KICKED',
@@ -65,6 +66,10 @@ export function OnlineSessionProvider({ children }: PropsWithChildren) {
 
   const updateSnapshot = useCallback((result: OnlineRpcResult) => {
     if (!mountedRef.current) return
+    if (!shouldApplyCanonicalSnapshot(snapshotRef.current, result)) {
+      setLastCode(result.ok ? null : result.code)
+      return
+    }
     snapshotRef.current = result
     setSnapshot(result)
     setLastCode(result.ok ? null : result.code)
@@ -387,6 +392,7 @@ export function OnlineSessionProvider({ children }: PropsWithChildren) {
       const sentAt = Date.now()
       const result = await request(client)
       recordRpcClock(result, sentAt, Date.now())
+      if (result.code === 'ONLINE_UNAVAILABLE') setConnection('reconnecting')
       return await connectCanonicalResult(result)
     } finally {
       if (mountedRef.current) setBusy(false)
@@ -405,6 +411,7 @@ export function OnlineSessionProvider({ children }: PropsWithChildren) {
       const sentAt = Date.now()
       const result = await request(client, current)
       recordRpcClock(result, sentAt, Date.now())
+      if (result.code === 'ONLINE_UNAVAILABLE') setConnection('reconnecting')
       updateSnapshot(result)
       return result.ok
     } finally {

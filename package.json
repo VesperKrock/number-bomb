@@ -18,6 +18,7 @@
     "test:e2e:ui": "playwright test --ui",
     "qa:visual": "node scripts/capture-visuals.mjs",
     "qa:visual:nb2r": "node scripts/capture-nb2r-visuals.mjs",
+    "qa:visual:online": "node scripts/capture-online-visuals.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

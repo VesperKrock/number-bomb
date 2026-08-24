@@ -43,8 +43,16 @@ export default function App() {
     setSession(null)
     setMode(nextMode)
     try {
-      if (nextMode === 'home') window.sessionStorage.removeItem(MODE_STORAGE_KEY)
-      else window.sessionStorage.setItem(MODE_STORAGE_KEY, nextMode)
+      if (nextMode === 'home') {
+        window.sessionStorage.removeItem(MODE_STORAGE_KEY)
+        const url = new URL(window.location.href)
+        if (url.searchParams.has('room')) {
+          url.searchParams.delete('room')
+          window.history.replaceState(null, '', url)
+        }
+      } else {
+        window.sessionStorage.setItem(MODE_STORAGE_KEY, nextMode)
+      }
     } catch {
       // Mode selection still works for the current render without storage.
     }

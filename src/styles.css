@@ -3785,11 +3785,17 @@ button:not(:disabled) {
 @media (prefers-reduced-motion: reduce) {
   .online-boom-result,
   .online-boom-result::before,
-  .online-boom-result .impact-flash,
-  .online-boom-result .impact-wash,
   .online-boom-result .fragments i,
   .online-boom-result .boom-result__content,
   .online-connecting i {
     animation: none !important;
+  }
+
+  .online-boom-result .impact-flash {
+    animation: impact-flash 50ms ease-out both !important;
+  }
+
+  .online-boom-result .impact-wash {
+    animation: impact-wash 180ms ease-out both !important;
   }
 }

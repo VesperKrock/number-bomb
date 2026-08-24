@@ -25,7 +25,13 @@ export async function callOnlineRpc(
   functionName: string,
   args: RpcArguments,
 ): Promise<OnlineRpcResult> {
-  const { data, error } = await client.rpc(functionName, args)
+  const invoke = () => client.rpc(functionName, args)
+  let { data, error } = await invoke()
+  if (error) {
+    const retry = await invoke()
+    data = retry.data
+    error = retry.error
+  }
   if (error || !data || typeof data !== 'object') return unavailableResult()
   return data as OnlineRpcResult
 }
