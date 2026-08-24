@@ -1,4 +1,5 @@
 import type { TensionProfile } from '../presentation/tension'
+import type { ExplosionAudioProfile } from './contract'
 
 export const MASTER_DYNAMICS = {
   masterGain: 0.95,
@@ -115,6 +116,31 @@ export const BOOM_MIX = {
   },
 } as const
 
+export const EXPLOSION_PRESENTATION_MIX = {
+  victim: {
+    perceivedImpact: 1,
+    transient: 1,
+    audibleBody: 1,
+    subImpact: 1,
+    destruction: 1,
+    electrical: 1,
+    tail: 1,
+    muffledAftermath: true,
+    ringing: true,
+  },
+  spectator: {
+    perceivedImpact: 0.45,
+    transient: 0.45,
+    audibleBody: 0.4,
+    subImpact: 0.3,
+    destruction: 0.4,
+    electrical: 0.4,
+    tail: 0.35,
+    muffledAftermath: false,
+    ringing: false,
+  },
+} as const
+
 export function getInteractionSfxMix(profile: TensionProfile) {
   return {
     selection: {
@@ -134,6 +160,17 @@ export function getInteractionSfxMix(profile: TensionProfile) {
 
 export function getBoomImpactGain(profile: TensionProfile): number {
   return profile.audio.boomImpactGain
+}
+
+export function getExplosionPresentationMix(
+  profile: TensionProfile,
+  presentation: ExplosionAudioProfile,
+) {
+  const mix = EXPLOSION_PRESENTATION_MIX[presentation]
+  return {
+    ...mix,
+    impactGain: getBoomImpactGain(profile) * mix.perceivedImpact,
+  }
 }
 
 export function getHeartbeatDubDelay(heartbeatBpm: number): number {

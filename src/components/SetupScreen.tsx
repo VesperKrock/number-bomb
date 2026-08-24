@@ -17,12 +17,13 @@ interface SetupScreenProps {
   audio: GameAudioControls
   haptics: GameHapticsControls
   onStart: (result: SetupResult) => void
+  onBack?: () => void
 }
 
 const PLAYER_OPTIONS = [2, 3, 4] as const
 const SETUP_TENSION = getTensionProfile(MAX_NUMBER - MIN_NUMBER + 1)
 
-export function SetupScreen({ audio, haptics, onStart }: SetupScreenProps) {
+export function SetupScreen({ audio, haptics, onStart, onBack }: SetupScreenProps) {
   const [playerCount, setPlayerCount] = useState(2)
   const [names, setNames] = useState(['', '', '', ''])
   const [randomizeStarter, setRandomizeStarter] = useState(false)
@@ -43,7 +44,14 @@ export function SetupScreen({ audio, haptics, onStart }: SetupScreenProps) {
   return (
     <main className="setup-screen">
       <div className="setup-topbar">
-        <span className="protocol-label">BS//LOCAL</span>
+        <div className="setup-topbar__identity">
+          {onBack && (
+            <button type="button" className="back-button" onClick={onBack}>
+              ← MENU
+            </button>
+          )}
+          <span className="protocol-label">BS//LOCAL</span>
+        </div>
         <div className="settings-controls">
           <AudioToggle muted={audio.muted} onToggle={audio.toggleMuted} />
           {haptics.supported && (

@@ -21,8 +21,10 @@ export default defineConfig({
   webServer: {
     command: 'node ./node_modules/vite/bin/vite.js --host 127.0.0.1 --port 41739 --strictPort',
     url: 'http://127.0.0.1:41739',
-    reuseExistingServer: true,
+    reuseExistingServer: process.env.PLAYWRIGHT_REUSE_SERVER !== '0',
     env: {
+      VITE_SUPABASE_URL: process.env.VITE_SUPABASE_URL ?? '',
+      VITE_SUPABASE_PUBLISHABLE_KEY: process.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? '',
       VITE_E2E_BOMB_NUMBER: '81',
       VITE_E2E_FAST: '1',
       VITE_E2E_AUDIO_DIAGNOSTICS: '1',

@@ -1,4 +1,4 @@
-export type HapticCue = 'select' | 'lock' | 'safe' | 'boom'
+export type HapticCue = 'select' | 'lock' | 'safe' | 'boom' | 'boomSpectator'
 
 export type HapticPattern = number | number[]
 
@@ -11,6 +11,7 @@ export const HAPTIC_PATTERNS = {
   lock: 28,
   safe: [16, 32, 16],
   boom: [70, 30, 120],
+  boomSpectator: [30, 25, 45],
 } as const
 
 function getDefaultTarget(): VibrationTarget | undefined {

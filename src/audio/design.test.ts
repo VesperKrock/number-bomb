@@ -2,9 +2,11 @@ import { describe, expect, it } from 'vitest'
 import { getTensionProfile } from '../presentation/tension'
 import {
   BOOM_MIX,
+  EXPLOSION_PRESENTATION_MIX,
   INTERACTION_SFX,
   MASTER_DYNAMICS,
   getBoomImpactGain,
+  getExplosionPresentationMix,
   getHeartbeatDubDelay,
   getInteractionSfxMix,
 } from './design'
@@ -82,6 +84,27 @@ describe('controlled audio product design', () => {
 
   it('keeps ringing independent from the adaptive BOOM impact bus', () => {
     expect(BOOM_MIX.ringing.busGain).toBe(0.034)
+  })
+
+  it('uses a dedicated spectator mix without ringing or aggressive aftermath', () => {
+    expect(EXPLOSION_PRESENTATION_MIX.spectator).toMatchObject({
+      perceivedImpact: 0.45,
+      transient: 0.45,
+      audibleBody: 0.4,
+      subImpact: 0.3,
+      tail: 0.35,
+      muffledAftermath: false,
+      ringing: false,
+    })
+    expect(EXPLOSION_PRESENTATION_MIX.victim).toMatchObject({
+      perceivedImpact: 1,
+      muffledAftermath: true,
+      ringing: true,
+    })
+
+    const profile = getTensionProfile(5)
+    expect(getExplosionPresentationMix(profile, 'victim').impactGain).toBe(1.8)
+    expect(getExplosionPresentationMix(profile, 'spectator').impactGain).toBeCloseTo(0.81)
   })
 
   it('reserves headroom and caps the final graph with a limiter', () => {
