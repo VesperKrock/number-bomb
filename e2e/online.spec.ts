@@ -180,6 +180,54 @@ function setLocalBomb(roomCode: string, bombNumber: number) {
   ])
 }
 
+function readLocalRoomLifecycle(roomCode: string): {
+  roomStatus: string
+  activeMemberships: number
+  gamePhase: string
+  gameVersion: number
+  actionCount: number
+} {
+  if (!/^[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{5}$/u.test(roomCode)) {
+    throw new Error('Unsafe room code in local E2E helper.')
+  }
+  const sql = [
+    'select room.status,',
+    "count(*) filter (where player.membership_status = 'ACTIVE'),",
+    'game.phase, game.version,',
+    '(select count(*) from public.game_actions as action where action.game_id = game.id)',
+    'from public.rooms as room',
+    'join public.room_players as player on player.room_id = room.id',
+    'join lateral (select current_game.* from public.room_games as current_game',
+    'where current_game.room_id = room.id order by current_game.round_number desc limit 1) as game on true',
+    `where room.code = '${roomCode}'`,
+    'group by room.status, game.phase, game.version, game.id;',
+  ].join(' ')
+  const result = execFileSync('docker', [
+    'exec',
+    'supabase_db_number-bomb',
+    'psql',
+    '-U',
+    'postgres',
+    '-d',
+    'postgres',
+    '-At',
+    '-F',
+    '|',
+    '-v',
+    'ON_ERROR_STOP=1',
+    '-c',
+    sql,
+  ], { encoding: 'utf8' }).trim()
+  const [roomStatus, activeMemberships, gamePhase, gameVersion, actionCount] = result.split('|')
+  return {
+    roomStatus,
+    activeMemberships: Number(activeMemberships),
+    gamePhase,
+    gameVersion: Number(gameVersion),
+    actionCount: Number(actionCount),
+  }
+}
+
 function expireLocalTurn(roomCode: string) {
   if (!/^[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{5}$/u.test(roomCode)) {
     throw new Error('Unsafe room code in local E2E helper.')
@@ -585,6 +633,101 @@ test('four isolated devices keep canonical turn restrictions and seat rotation',
 
   await expect(host.getByTestId('online-current-player')).toHaveText('P1 Host')
   await Promise.all(contexts.map((context) => context.close()))
+})
+
+test('friends leaving are removed from turn order and current departure advances canonically', async ({ browser }) => {
+  test.setTimeout(45_000)
+  const contexts = await Promise.all(Array.from({ length: 4 }, () => browser.newContext()))
+  const host = await createOnlinePage(contexts[0])
+  const roomCode = await createLobbyRoom(host, 'Leave P1')
+  const pages = [host]
+
+  for (let index = 1; index < contexts.length; index += 1) {
+    const peer = await contexts[index].newPage()
+    await joinLobbyRoom(peer, roomCode, `Leave P${index + 1}`)
+    pages.push(peer)
+  }
+
+  await expect(host.getByTestId('online-roster-player')).toHaveCount(4)
+  await host.getByRole('button', { name: 'BẮT ĐẦU ONLINE' }).click()
+  await expect(pages[3].getByTestId('number-board')).toBeVisible()
+  setLocalBomb(roomCode, 81)
+
+  await pages[3].getByRole('button', { name: 'RỜI', exact: true }).click()
+  await expect(host.locator('.turn-order li')).toHaveCount(3)
+  await expect(host.locator('.turn-order')).not.toContainText('Leave P4')
+  await expect(host.getByTestId('online-current-player')).toHaveText('Leave P1')
+  await expect(host.getByTestId('online-room-activity').filter({
+    hasText: 'Leave P4 ĐÃ RỜI PHÒNG.',
+  })).toHaveCount(1)
+
+  await host.getByRole('button', { name: 'RỜI', exact: true }).click()
+  await expect(pages[1].getByTestId('online-current-player')).toHaveText('Leave P2')
+  await expect(pages[2].getByTestId('online-current-player')).toHaveText('Leave P2')
+  await expect(pages[1].locator('.turn-order li')).toHaveCount(2)
+  await expect(pages[1].locator('.turn-order')).not.toContainText('Leave P1')
+  await expect(pages[1].locator('.turn-order')).not.toContainText('Leave P4')
+  await expect(pages[1].getByTestId('online-room-activity').filter({
+    hasText: 'Leave P1 ĐÃ RỜI PHÒNG.',
+  })).toHaveCount(1)
+
+  await pages[1].getByRole('button', { name: 'Chọn số 25' }).click()
+  await pages[1].getByRole('button', { name: 'KHÓA SỐ' }).click()
+  await expect(pages[1].getByTestId('online-valid-range')).toContainText('26')
+  await expect(pages[2].getByTestId('online-current-player')).toHaveText('Leave P3')
+
+  await Promise.all(contexts.map((context) => context.close()))
+})
+
+test('two friends shrink to solo SAFE continuation, then the empty room closes', async ({ browser }) => {
+  test.setTimeout(35_000)
+  const hostContext = await browser.newContext()
+  const peerContext = await browser.newContext()
+  const host = await createOnlinePage(hostContext)
+  const roomCode = await createLobbyRoom(host, 'Solo Leaver')
+  const peer = await peerContext.newPage()
+  await joinLobbyRoom(peer, roomCode, 'Solo Friend')
+  await expect(host.getByTestId('online-roster-player')).toHaveCount(2)
+
+  await host.getByRole('button', { name: 'BẮT ĐẦU ONLINE' }).click()
+  await expect(peer.getByTestId('number-board')).toBeVisible()
+  setLocalBomb(roomCode, 81)
+
+  await host.getByRole('button', { name: 'RỜI', exact: true }).click()
+  await expect(peer.getByTestId('online-current-player')).toHaveText('Solo Friend')
+  await expect(peer.locator('.turn-order li')).toHaveCount(1)
+  await expect(peer.locator('.turn-order')).toHaveText(/Solo Friend/u)
+  await expect(peer.getByTestId('online-room-activity').filter({
+    hasText: 'Solo Leaver ĐÃ RỜI PHÒNG.',
+  })).toHaveCount(1)
+
+  await peer.getByRole('button', { name: 'Chọn số 25' }).click()
+  await peer.getByRole('button', { name: 'KHÓA SỐ' }).click()
+  await expect(peer.getByTestId('online-valid-range')).toContainText('26')
+  await expect(peer.getByTestId('online-current-player')).toHaveText('Solo Friend')
+  await expect(peer.locator('.turn-order li')).toHaveCount(1)
+
+  const beforeClose = readLocalRoomLifecycle(roomCode)
+  expect(beforeClose).toMatchObject({
+    roomStatus: 'PLAYING',
+    activeMemberships: 1,
+    gamePhase: 'PLAYING_TURN',
+    actionCount: 3,
+  })
+
+  await peer.getByRole('button', { name: 'RỜI', exact: true }).click()
+  await expect(peer.getByRole('button', { name: 'CHƠI ONLINE' })).toBeVisible()
+  await expect(peer.getByTestId('number-board')).toHaveCount(0)
+  const closed = readLocalRoomLifecycle(roomCode)
+  expect(closed).toMatchObject({
+    roomStatus: 'CLOSED',
+    activeMemberships: 0,
+    gamePhase: 'PLAYING_TURN',
+    actionCount: 3,
+  })
+
+  await hostContext.close()
+  await peerContext.close()
 })
 
 test('Cron synchronizes SELF_DESTRUCT copy after a deadline reload', async ({ browser }) => {

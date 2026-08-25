@@ -26,17 +26,21 @@ export function OnlineTurnPanel({
   selfPlayerId,
   liveSelectionCopy,
 }: OnlineTurnPanelProps) {
-  const currentPlayer = players.find((player) => player.id === game.currentPlayerId)
   const ordered = gamePlayers
+    .filter((participant) => participant.participationStatus === 'ACTIVE')
     .slice()
     .sort((left, right) => left.seat - right.seat)
     .map((participant) => players.find((player) => player.id === participant.playerId))
-    .filter((player): player is OnlinePlayer => Boolean(player))
+    .filter((player): player is OnlinePlayer => player?.membershipStatus === 'ACTIVE')
+  const currentPlayer = ordered.find((player) => player.id === game.currentPlayerId)
   const currentIndex = ordered.findIndex((player) => player.id === game.currentPlayerId)
   const rotated = currentIndex < 0
     ? ordered
     : ordered.map((_, offset) => ordered[(currentIndex + offset) % ordered.length])
-  const currentParticipant = gamePlayers.find((player) => player.playerId === game.currentPlayerId)
+  const currentParticipant = gamePlayers.find((player) => (
+    player.playerId === game.currentPlayerId
+    && player.participationStatus === 'ACTIVE'
+  ))
 
   return (
     <section className="turn-panel online-turn-panel" aria-label="Thông tin lượt chơi online">
