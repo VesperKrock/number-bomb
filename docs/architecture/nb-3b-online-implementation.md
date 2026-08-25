@@ -10,7 +10,7 @@ Authority contract: `docs/architecture/nb-3a-online-multiplayer-supabase-contrac
 
 Online V1 is implemented and verified against the repo-local Supabase stack. The accepted local hot-seat game remains a sibling mode and works without Supabase configuration or network access.
 
-The hosted Supabase project has **not** been migrated or deployed from this workspace. A browser publishable key cannot perform those operations, and no admin credential was requested, inferred, stored, or logged.
+The hosted Supabase project now has reviewed migrations `202608250001` through `202608250008` applied. Migration 008 is the NB-3D1 forward-only private-function ACL repair. The frontend has not been deployed and the controlled hosted business smoke remains intentionally deferred to the resumed NB-3D gate.
 
 ## Implemented product flow
 
@@ -46,6 +46,7 @@ The ordered migration set is complete:
 | `202608250005_online_gameplay_rpcs.sql` | secure random, start/lock/timeout/finalize/replay/lobby RPCs |
 | `202608250006_online_realtime_cron.sql` | restricted private channel, due sweep, expiry and anonymous cleanup jobs |
 | `202608250007_online_contract_tests.sql` | deployment-safe catalog/security invariants |
+| `202608250008_online_private_function_acl_hardening.sql` | close inherited private-function execute rights and whitelist exact Realtime helpers |
 
 Canonical randomness uses rejection sampling over `gen_random_bytes`; SQL `random()` is not used. Every public mutation RPC is `SECURITY DEFINER`, uses an empty `search_path`, qualified identifiers, authenticated-only execute grants, version checks, row locking and UUID request idempotency. Direct client writes are revoked.
 
@@ -104,38 +105,29 @@ Final clean run on 2026-08-25:
 
 - `npm run typecheck`: PASS.
 - `npm run lint`: PASS with no warnings.
-- `npm run test:unit`: 80/80 PASS across 14 files.
-- `npm run test:db`: 85/85 pgTAP assertions PASS across 3 files.
+- `npm run test:unit`: 97/97 PASS across 19 files.
+- `npm run test:db`: 98/98 pgTAP assertions PASS across 4 files.
 - `npx supabase db lint --local --level error`: no schema errors.
-- `npm run test:e2e`: 32/32 Playwright tests PASS, including all accepted local regression tests.
+- `npm run test:e2e`: 36/36 Playwright tests PASS, including all accepted local regression tests and deterministic lost-event recovery.
 - `npm run build`: PASS; Online remains a separate lazy chunk.
 - Repeatable visual QA: PASS at 1440×900, 1366×768, 390×844 and 440×956; no horizontal overflow, mobile number-field-only scrolling, reachable dock, desktop viewport fit and reduced-motion result checked. The existing local visual suite also completed successfully.
 
-## Hosted project handoff
+## Hosted project state and handoff
 
-The intended hosted project ref is `cmjhzbhxpqqhamksbkxk`. An authorized operator must run:
+The hosted project ref `cmjhzbhxpqqhamksbkxk` has an exact migration ledger from `202608250001` through `202608250008`. Post-008 catalog verification proves all private routines deny `PUBLIC` and `anon`, `authenticated` can execute only the three Realtime helpers, all 14 public RPC grants remain intact, all seven Number Bomb tables retain RLS, both private tables retain zero client table privileges, and the three Cron jobs remain active. All seven Number Bomb business tables were still empty after the ACL deployment.
 
-```bash
-npx supabase login
-npx supabase link --project-ref cmjhzbhxpqqhamksbkxk
-npx supabase db push --include-all
-```
+Remaining release steps are deliberately separate:
 
-Equivalent Dashboard path: run the seven files under `supabase/migrations/` in filename order using the SQL Editor while authenticated as a project administrator.
-
-Then:
-
-1. Enable **Authentication → Providers → Anonymous Sign-Ins**.
-2. Confirm the three `number-bomb-online-*` Cron jobs exist and are active.
-3. Add GitHub Actions repository variables `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY`.
-4. Run one hosted two-device smoke test: create, join, SAFE, timeout, BOOM, reload and replay.
-5. Inspect Auth rate limits/CAPTCHA policy before public traffic.
+1. Resume the controlled hosted two-device smoke: create, join, SAFE, timeout, BOOM, reload and replay.
+2. Add/verify GitHub Actions repository variables `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY` before frontend deployment.
+3. Inspect Auth rate limits/CAPTCHA policy before public traffic.
+4. Review, push, merge and deploy only through explicitly authorized later gates.
 
 The checked-in Pages workflow already passes exactly those two browser-safe variables to `npm run build`; `.env.local` remains ignored.
 
 ## Operational risks / remaining external gates
 
-- Hosted migrations, Anonymous Auth enablement and GitHub variable configuration require project/repository admin access and remain unapplied here.
+- Controlled hosted business smoke, GitHub variable verification, branch review/merge and frontend deployment remain unapplied here.
 - Anonymous public rooms can be abused; configure Supabase Auth rate limits and CAPTCHA according to expected traffic.
 - Presence is deliberately advisory. Database membership, versions, deadlines and RPC validation remain authoritative when Presence is stale or spoofed.
 - Internet latency can exceed the ≤200 ms local/test result-onset target. Late clients present canonical results immediately and do not replay stale suspense.

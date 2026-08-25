@@ -85,6 +85,14 @@ async function readDiagnostics(page: Page): Promise<Diagnostic[]> {
   ).__BOM_SO_ONLINE_CONVERGENCE_DIAGNOSTICS__ ?? [])
 }
 
+async function expectChannelSubscribed(page: Page): Promise<void> {
+  await expect.poll(async () => (
+    (await readDiagnostics(page)).some(
+      (event) => event.kind === 'CHANNEL_STATUS' && event.source === 'SUBSCRIBED',
+    )
+  )).toBe(true)
+}
+
 async function openOnlineEntry(page: Page, roomCode?: string): Promise<void> {
   await page.goto(roomCode ? `/?room=${roomCode}` : '/')
   if (!roomCode) await page.locator('.mode-card--online').click()
@@ -160,6 +168,7 @@ test.describe('deterministic missed-event anti-entropy', () => {
   test('repairs a completely silent JOIN and rejects duplicate/out-of-order wakes after recovery', async ({ browser }) => {
     const { hostContext, peerContext, host, peer } = await twoControlledPages(browser)
     const roomCode = await createRoom(host, 'Silent Host')
+    await expectChannelSubscribed(host)
     await setDropRules(host, [
       { table: 'rooms' },
       { table: 'room_players' },
