@@ -9,12 +9,13 @@ import {
 } from './haptics'
 
 describe('semantic mobile haptics', () => {
-  it('uses the restrained NB-2R event patterns', () => {
+  it('preserves NB-2R patterns and adds the reduced online spectator impact', () => {
     expect(HAPTIC_PATTERNS).toEqual({
       select: 10,
       lock: 28,
       safe: [16, 32, 16],
       boom: [70, 30, 120],
+      boomSpectator: [30, 25, 45],
     })
   })
 
@@ -29,6 +30,7 @@ describe('semantic mobile haptics', () => {
     ['lock', 28],
     ['safe', [16, 32, 16]],
     ['boom', [70, 30, 120]],
+    ['boomSpectator', [30, 25, 45]],
   ] as const)('sends %s only as its semantic event pattern', (cue, expectedPattern) => {
     const vibrate = vi.fn<(pattern: HapticPattern) => boolean>(() => true)
 

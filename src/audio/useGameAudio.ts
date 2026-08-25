@@ -3,6 +3,7 @@ import type { TensionProfile } from '../presentation/tension'
 import { GameAudio } from './GameAudio'
 import {
   GAME_AUDIO_CONTRACT_VERSION,
+  type ExplosionAudioProfile,
   type GameAudioControls,
 } from './contract'
 
@@ -82,7 +83,8 @@ export function useGameAudio(): GameAudioControls {
   )
   const playSafe = useCallback(() => manager.playSafe(), [manager])
   const playExplosion = useCallback(
-    (profile: TensionProfile) => manager.playExplosion(profile),
+    (profile: TensionProfile, presentation?: ExplosionAudioProfile) =>
+      manager.playExplosion(profile, presentation),
     [manager],
   )
   const startSoundscape = useCallback(

@@ -1,10 +1,14 @@
 import type { TensionProfile } from '../presentation/tension'
-import type { GameAudioDiagnostics, GameAudioLifecycle } from './contract'
+import type {
+  ExplosionAudioProfile,
+  GameAudioDiagnostics,
+  GameAudioLifecycle,
+} from './contract'
 import {
   BOOM_MIX,
   INTERACTION_SFX,
   MASTER_DYNAMICS,
-  getBoomImpactGain,
+  getExplosionPresentationMix,
   getHeartbeatDubDelay,
   getInteractionSfxMix,
 } from './design'
@@ -116,7 +120,10 @@ export class GameAudio implements GameAudioLifecycle {
     this.scheduleEffect(() => this.playRelayClick(0.038, 1_150), 112)
   }
 
-  playExplosion(profile: TensionProfile) {
+  playExplosion(
+    profile: TensionProfile,
+    presentation: ExplosionAudioProfile = 'victim',
+  ) {
     this.stopSoundscape()
     this.clearEffectActivity()
 
@@ -126,8 +133,8 @@ export class GameAudio implements GameAudioLifecycle {
     if (!context || !output || this.muted) return
 
     const now = context.currentTime
-    const boomImpactGain = getBoomImpactGain(profile)
-    this.lastBoomImpactGain = boomImpactGain
+    const presentationMix = getExplosionPresentationMix(profile, presentation)
+    this.lastBoomImpactGain = presentationMix.impactGain
 
     const impactBus = context.createGain()
     const aftermathBus = context.createGain()
@@ -136,7 +143,7 @@ export class GameAudio implements GameAudioLifecycle {
     const destructionGain = context.createGain()
 
     impactBus.gain.setValueAtTime(
-      boomImpactGain,
+      profile.audio.boomImpactGain,
       now,
     )
 
@@ -164,15 +171,19 @@ export class GameAudio implements GameAudioLifecycle {
     destructionShaper.oversample = '2x'
 
     destructionGain.gain.setValueAtTime(
-      0.74,
+      0.74 * presentationMix.destruction,
       now,
     )
 
     impactBus.connect(output)
 
-    aftermathBus
-      .connect(aftermathFilter)
-      .connect(impactBus)
+    if (presentationMix.muffledAftermath) {
+      aftermathBus
+        .connect(aftermathFilter)
+        .connect(impactBus)
+    } else {
+      aftermathBus.connect(impactBus)
+    }
 
     destructionShaper
       .connect(destructionGain)
@@ -186,7 +197,7 @@ export class GameAudio implements GameAudioLifecycle {
       output: impactBus,
       startAt: now,
       duration: BOOM_MIX.transient.duration,
-      volume: BOOM_MIX.transient.volume,
+      volume: BOOM_MIX.transient.volume * presentationMix.transient,
       filterType: 'highpass',
       startFrequency: BOOM_MIX.transient.startFrequency,
       endFrequency: BOOM_MIX.transient.endFrequency,
@@ -198,7 +209,7 @@ export class GameAudio implements GameAudioLifecycle {
       output: impactBus,
       startAt: now + 0.006,
       duration: 0.092,
-      volume: 0.28,
+      volume: 0.28 * presentationMix.transient,
       filterType: 'bandpass',
       startFrequency: 2_850,
       endFrequency: 920,
@@ -216,7 +227,7 @@ export class GameAudio implements GameAudioLifecycle {
       body.startFrequency,
       body.endFrequency,
       body.duration,
-      body.volume,
+      body.volume * presentationMix.audibleBody,
       'triangle',
     )
 
@@ -227,7 +238,7 @@ export class GameAudio implements GameAudioLifecycle {
       128,
       72,
       0.58,
-      0.24,
+      0.24 * presentationMix.audibleBody,
       'sine',
     )
 
@@ -241,7 +252,7 @@ export class GameAudio implements GameAudioLifecycle {
       sub.startFrequency,
       sub.endFrequency,
       sub.duration,
-      sub.volume,
+      sub.volume * presentationMix.subImpact,
       'sine',
     )
 
@@ -268,7 +279,7 @@ export class GameAudio implements GameAudioLifecycle {
       output: aftermathBus,
       startAt: now + electrical.delay,
       duration: electrical.duration,
-      volume: electrical.volume,
+      volume: electrical.volume * presentationMix.electrical,
       filterType: 'bandpass',
       startFrequency: electrical.startFrequency,
       endFrequency: electrical.endFrequency,
@@ -283,7 +294,7 @@ export class GameAudio implements GameAudioLifecycle {
       output: aftermathBus,
       startAt: now + tail.delay,
       duration: tail.duration,
-      volume: tail.volume,
+      volume: tail.volume * presentationMix.tail,
       filterType: 'lowpass',
       startFrequency: tail.startFrequency,
       endFrequency: tail.endFrequency,
@@ -297,15 +308,17 @@ export class GameAudio implements GameAudioLifecycle {
       98,
       48,
       1.12,
-      0.18,
+      0.18 * presentationMix.tail,
       'triangle',
     )
 
-    this.playRinging(
-      context,
-      output,
-      now + BOOM_MIX.ringing.delay,
-    )
+    if (presentationMix.ringing) {
+      this.playRinging(
+        context,
+        output,
+        now + BOOM_MIX.ringing.delay,
+      )
+    }
   }
 
   startSoundscape(profile: TensionProfile) {

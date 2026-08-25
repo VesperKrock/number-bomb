@@ -3,6 +3,9 @@ import { defineConfig, devices } from '@playwright/test'
 export default defineConfig({
   testDir: './e2e',
   fullyParallel: false,
+  // Online specs share one repo-local Supabase stack. Keep repeated two-device
+  // flows serial so they exercise convergence rather than saturating Realtime/Auth.
+  workers: 1,
   timeout: 20_000,
   expect: { timeout: 5_000 },
   reporter: [['list'], ['html', { open: 'never' }]],
@@ -21,8 +24,10 @@ export default defineConfig({
   webServer: {
     command: 'node ./node_modules/vite/bin/vite.js --host 127.0.0.1 --port 41739 --strictPort',
     url: 'http://127.0.0.1:41739',
-    reuseExistingServer: true,
+    reuseExistingServer: process.env.PLAYWRIGHT_REUSE_SERVER !== '0',
     env: {
+      VITE_SUPABASE_URL: process.env.VITE_SUPABASE_URL ?? '',
+      VITE_SUPABASE_PUBLISHABLE_KEY: process.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? '',
       VITE_E2E_BOMB_NUMBER: '81',
       VITE_E2E_FAST: '1',
       VITE_E2E_AUDIO_DIAGNOSTICS: '1',

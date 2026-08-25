@@ -1,0 +1,991 @@
+import {
+  type PropsWithChildren,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
+import type {
+  RealtimeChannel,
+  RealtimePostgresChangesPayload,
+  SupabaseClient,
+} from '@supabase/supabase-js'
+import { getAntiEntropyPhase, getAntiEntropyPolicy } from '../antiEntropy'
+import { ensureAnonymousIdentity } from '../auth'
+import { ServerClock } from '../clock'
+import { getSupabaseClient } from '../client'
+import { getOnlineConfig } from '../config'
+import { isValidProvisionalSelection } from '../realtime/provisional'
+import {
+  shouldDropRealtimeChange,
+  type DroppedRealtimeChange,
+} from '../realtime/eventLossTestControl'
+import { onlineRpc } from '../rpc'
+import { clearRoomPointer, readRoomPointer, writeRoomPointer } from '../storage'
+import type {
+  OnlineConnectionState,
+  OnlineRoomSettings,
+  OnlineRpcResult,
+  PresencePayload,
+  RealtimeSelectionClearedEvent,
+  RealtimeSelectionEvent,
+} from '../types'
+import {
+  OnlineSessionContext,
+  type OnlineSessionValue,
+  type RemoteSelection,
+} from './OnlineSessionContext'
+import { traceOnlineConvergence } from './convergenceDiagnostics'
+import {
+  appendLiveGameTransition,
+  parseLiveGameTransition,
+  parseRealtimeGameState,
+  type LiveGameTransition,
+} from './liveGameTransition'
+import {
+  RoomActivityLedger,
+  type RoomActivity,
+  type RoomActivityObservationMode,
+} from './roomActivity'
+import { SnapshotConvergenceCoordinator } from './snapshotConvergence'
+import { reconcileCanonicalSnapshot } from './versionReducer'
+
+const TERMINAL_POINTER_CODES = new Set<OnlineRpcResult['code']>([
+  'KICKED',
+  'NOT_ROOM_MEMBER',
+  'ROOM_EXPIRED',
+  'ROOM_NOT_FOUND',
+])
+
+const E2E_EVENT_LOSS_CONTROL_ENABLED = import.meta.env.VITE_E2E_FAST === '1'
+
+function isCanonicalResult(result: OnlineRpcResult): boolean {
+  return result.room !== null && result.selfPlayerId !== null
+}
+
+export function OnlineSessionProvider({ children }: PropsWithChildren) {
+  const config = getOnlineConfig()
+  const clientRef = useRef<SupabaseClient | null>(null)
+  const channelRef = useRef<RealtimeChannel | null>(null)
+  const snapshotRef = useRef<OnlineRpcResult | null>(null)
+  const mountedRef = useRef(true)
+  const selectionSeqRef = useRef(0)
+  const remoteSelectionTimerRef = useRef<number | null>(null)
+  const remoteSelectionRef = useRef<RemoteSelection | null>(null)
+  const clockRef = useRef(new ServerClock())
+  const clientInstanceIdRef = useRef<string | null>(null)
+  if (clientInstanceIdRef.current === null) clientInstanceIdRef.current = crypto.randomUUID()
+  const clientInstanceId = clientInstanceIdRef.current
+  const snapshotCoordinatorRef = useRef<SnapshotConvergenceCoordinator | null>(null)
+  if (snapshotCoordinatorRef.current === null) {
+    snapshotCoordinatorRef.current = new SnapshotConvergenceCoordinator((event) => {
+      const current = snapshotRef.current
+      if (event.kind === 'QUEUED') {
+        traceOnlineConvergence({
+          clientInstanceId,
+          kind: 'SNAPSHOT_COALESCED',
+          source: event.reason,
+          requestGeneration: event.generation ?? undefined,
+          roomVersion: current?.room?.version ?? null,
+          gameVersion: current?.game?.version ?? null,
+          playerCount: current?.players.length ?? 0,
+          phase: current?.game?.phase ?? null,
+          reason: 'TRAILING_RECOVERY_QUEUED',
+        })
+      }
+    })
+  }
+  const snapshotCoordinator = snapshotCoordinatorRef.current
+  const roomActivityLedgerRef = useRef<RoomActivityLedger | null>(null)
+  if (roomActivityLedgerRef.current === null) {
+    roomActivityLedgerRef.current = new RoomActivityLedger()
+  }
+  const roomActivityLedger = roomActivityLedgerRef.current
+  const activityHydrationPendingRef = useRef(true)
+  const [connection, setConnection] = useState<OnlineConnectionState>(
+    config.available ? 'authenticating' : 'unavailable',
+  )
+  const [snapshot, setSnapshot] = useState<OnlineRpcResult | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [lastCode, setLastCode] = useState<OnlineRpcResult['code'] | null>(null)
+  const [presencePlayerIds, setPresencePlayerIds] = useState<ReadonlySet<string>>(new Set())
+  const [remoteSelection, setRemoteSelection] = useState<RemoteSelection | null>(null)
+  const [liveGameTransitions, setLiveGameTransitions] = useState<readonly LiveGameTransition[]>([])
+  const [roomActivities, setRoomActivities] = useState<readonly RoomActivity[]>([])
+  const activeRoomId = snapshot?.room?.id ?? null
+  const activeGamePhase = snapshot?.game?.phase ?? null
+
+  const updateSnapshot = useCallback((
+    result: OnlineRpcResult,
+    observationMode: RoomActivityObservationMode = 'LIVE',
+  ) => {
+    if (!mountedRef.current) return
+    const previous = snapshotRef.current
+    const reconciled = reconcileCanonicalSnapshot(previous, result)
+    if (reconciled === previous) {
+      traceOnlineConvergence({
+        clientInstanceId,
+        kind: 'SNAPSHOT_IGNORED',
+        roomVersion: result.room?.version ?? null,
+        gameVersion: result.game?.version ?? null,
+        playerCount: result.players.length,
+        phase: result.game?.phase ?? null,
+        reason: 'CANONICAL_VERSION_REJECTED',
+      })
+      setLastCode(result.ok ? null : result.code)
+      return
+    }
+    if (previous?.room?.id !== reconciled.room?.id) setRoomActivities([])
+    const effectiveObservationMode = observationMode === 'HYDRATE'
+      || activityHydrationPendingRef.current
+      ? 'HYDRATE'
+      : 'LIVE'
+    const observedActivities = roomActivityLedger.observe(
+      reconciled,
+      effectiveObservationMode,
+    )
+    if (observedActivities.length > 0) {
+      setRoomActivities((current) => [...current, ...observedActivities].slice(-3))
+    }
+    snapshotRef.current = reconciled
+    traceOnlineConvergence({
+      clientInstanceId,
+      kind: 'SNAPSHOT_APPLIED',
+      roomVersion: reconciled.room?.version ?? null,
+      gameVersion: reconciled.game?.version ?? null,
+      playerCount: reconciled.players.length,
+      phase: reconciled.game?.phase ?? null,
+    })
+    setSnapshot(reconciled)
+    setLastCode(result.ok ? null : result.code)
+
+    if (reconciled.room && reconciled.selfPlayerId && reconciled.players.some(
+      (player) => player.id === reconciled.selfPlayerId && player.membershipStatus === 'ACTIVE',
+    )) {
+      writeRoomPointer({ roomId: reconciled.room.id, roomCode: reconciled.room.code })
+    }
+
+    if (TERMINAL_POINTER_CODES.has(result.code)) clearRoomPointer()
+  }, [clientInstanceId, roomActivityLedger])
+
+  const applyRealtimeGameState = useCallback((row: Record<string, unknown>) => {
+    const current = snapshotRef.current
+    const incomingGame = parseRealtimeGameState(row)
+    if (!current?.room || !incomingGame || incomingGame.roomId !== current.room.id) return
+    if (current.game) {
+      if (incomingGame.id !== current.game.id
+        || incomingGame.version !== current.game.version + 1
+      ) return
+    } else if (incomingGame.version !== 1) {
+      return
+    }
+
+    const next = { ...current, game: incomingGame }
+    snapshotRef.current = next
+    setSnapshot(next)
+    traceOnlineConvergence({
+      clientInstanceId,
+      kind: 'SNAPSHOT_APPLIED',
+      source: 'POSTGRES_GAME_DELTA',
+      roomVersion: current.room.version,
+      gameVersion: incomingGame.version,
+      playerCount: current.players.length,
+      phase: incomingGame.phase,
+    })
+  }, [clientInstanceId])
+
+  const recordRpcClock = useCallback((
+    result: OnlineRpcResult,
+    sentAtMs: number,
+    receivedAtMs: number,
+  ) => {
+    clockRef.current.addSample(sentAtMs, receivedAtMs, result.serverNow)
+  }, [])
+
+  const removeRoomChannel = useCallback(() => {
+    activityHydrationPendingRef.current = true
+    snapshotCoordinator.invalidate()
+    const channel = channelRef.current
+    channelRef.current = null
+    if (channel && clientRef.current) void clientRef.current.removeChannel(channel)
+    setPresencePlayerIds(new Set())
+    remoteSelectionRef.current = null
+    setRemoteSelection(null)
+    setLiveGameTransitions([])
+    if (remoteSelectionTimerRef.current !== null) {
+      window.clearTimeout(remoteSelectionTimerRef.current)
+      remoteSelectionTimerRef.current = null
+    }
+    if (E2E_EVENT_LOSS_CONTROL_ENABLED) {
+      const control = window.__BOM_SO_ONLINE_REALTIME_EVENT_LOSS__
+      if (control) delete control.inject
+    }
+  }, [snapshotCoordinator])
+
+  const refreshSnapshot = useCallback(async (
+    reason = 'MANUAL',
+    observationMode: RoomActivityObservationMode = 'LIVE',
+  ): Promise<boolean> => {
+    if (!snapshotRef.current?.room || !clientRef.current) return false
+    return snapshotCoordinator.request(reason, async ({
+      generation,
+      reason: recoveryReason,
+      isCurrent,
+    }) => {
+      const current = snapshotRef.current
+      const client = clientRef.current
+      if (!current?.room || !client || !isCurrent()) return false
+      const requestGeneration = generation
+      const roomId = current.room.id
+      traceOnlineConvergence({
+        clientInstanceId,
+        kind: 'SNAPSHOT_REQUEST',
+        source: recoveryReason,
+        requestGeneration,
+        roomVersion: current.room.version,
+        gameVersion: current.game?.version ?? null,
+        playerCount: current.players.length,
+        phase: current.game?.phase ?? null,
+      })
+      const sentAt = Date.now()
+      const result = await onlineRpc.snapshot(client, roomId)
+      recordRpcClock(result, sentAt, Date.now())
+      if (!isCurrent() || snapshotRef.current?.room?.id !== roomId) {
+        traceOnlineConvergence({
+          clientInstanceId,
+          kind: 'SNAPSHOT_IGNORED',
+          requestGeneration,
+          roomVersion: result.room?.version ?? null,
+          gameVersion: result.game?.version ?? null,
+          playerCount: result.players.length,
+          phase: result.game?.phase ?? null,
+          reason: 'RECOVERY_GENERATION_INVALIDATED',
+        })
+        return false
+      }
+      traceOnlineConvergence({
+        clientInstanceId,
+        kind: 'SNAPSHOT_RESPONSE',
+        requestGeneration,
+        roomVersion: result.room?.version ?? null,
+        gameVersion: result.game?.version ?? null,
+        playerCount: result.players.length,
+        phase: result.game?.phase ?? null,
+      })
+      updateSnapshot(result, observationMode)
+      if (TERMINAL_POINTER_CODES.has(result.code)) {
+        removeRoomChannel()
+        setConnection('offline')
+        return false
+      }
+      return isCanonicalResult(result)
+    })
+  }, [clientInstanceId, recordRpcClock, removeRoomChannel, snapshotCoordinator, updateSnapshot])
+
+  const touchAndReconcile = useCallback(async (
+    client: SupabaseClient,
+    roomId: string,
+    source: string,
+    observationMode: RoomActivityObservationMode = 'LIVE',
+  ): Promise<boolean> => {
+    const sentAt = Date.now()
+    const result = await onlineRpc.touch(client, roomId)
+    recordRpcClock(result, sentAt, Date.now())
+    if (snapshotRef.current?.room?.id !== roomId) return false
+    updateSnapshot(result, observationMode)
+    traceOnlineConvergence({
+      clientInstanceId,
+      kind: 'HEARTBEAT_RESPONSE_APPLIED',
+      source,
+      roomVersion: result.room?.version ?? null,
+      gameVersion: result.game?.version ?? null,
+      playerCount: result.players.length,
+      phase: result.game?.phase ?? null,
+    })
+    if (TERMINAL_POINTER_CODES.has(result.code)) {
+      removeRoomChannel()
+      setConnection('offline')
+      return false
+    }
+    return isCanonicalResult(result)
+  }, [clientInstanceId, recordRpcClock, removeRoomChannel, updateSnapshot])
+
+  const expireRemoteSelection = useCallback((selection: RemoteSelection) => {
+    remoteSelectionRef.current = selection
+    setRemoteSelection(selection)
+    if (remoteSelectionTimerRef.current !== null) {
+      window.clearTimeout(remoteSelectionTimerRef.current)
+    }
+    remoteSelectionTimerRef.current = window.setTimeout(() => {
+      setRemoteSelection((current) => current?.event.clientSeq === selection.event.clientSeq
+        ? (remoteSelectionRef.current = null)
+        : current)
+      remoteSelectionTimerRef.current = null
+    }, Math.max(0, selection.expiresAtMs - Date.now()))
+  }, [])
+
+  const subscribeToRoom = useCallback(async (initial: OnlineRpcResult): Promise<void> => {
+    const client = clientRef.current
+    const room = initial.room
+    const selfPlayerId = initial.selfPlayerId
+    if (!client || !room || !selfPlayerId) return
+
+    removeRoomChannel()
+    setConnection('connecting')
+
+    const channel = client.channel(`room:${room.id}`, {
+      config: {
+        private: true,
+        presence: { key: selfPlayerId },
+        broadcast: { self: false },
+      },
+    })
+    channelRef.current = channel
+
+    const wakeFromPostgres = (
+      payload: RealtimePostgresChangesPayload<Record<string, unknown>>,
+    ) => {
+      const current = snapshotRef.current
+      if (!current?.room) return
+      const eventLossControl = E2E_EVENT_LOSS_CONTROL_ENABLED
+        ? window.__BOM_SO_ONLINE_REALTIME_EVENT_LOSS__
+        : undefined
+      if (shouldDropRealtimeChange(
+        payload,
+        eventLossControl,
+        E2E_EVENT_LOSS_CONTROL_ENABLED,
+      )) {
+        traceOnlineConvergence({
+          clientInstanceId,
+          kind: 'REALTIME_EVENT_DROPPED_TEST_ONLY',
+          table: payload.table,
+          eventType: payload.eventType,
+          roomVersion: current.room.version,
+          gameVersion: current.game?.version ?? null,
+          playerCount: current.players.length,
+          phase: current.game?.phase ?? null,
+        })
+        return
+      }
+      const nextRow = payload.new as Record<string, unknown>
+      const incomingVersion = typeof nextRow.version === 'number' ? nextRow.version : null
+      const knownVersion = payload.table === 'rooms'
+        ? current.room.version
+        : current.game?.version ?? 0
+      if (payload.table === 'room_games') {
+        const transition = parseLiveGameTransition(nextRow)
+        if (transition && transition.roomId === current.room.id) {
+          setLiveGameTransitions((transitions) => appendLiveGameTransition(
+            transitions,
+            transition,
+          ))
+        }
+        applyRealtimeGameState(nextRow)
+      }
+      traceOnlineConvergence({
+        clientInstanceId,
+        kind: 'POSTGRES_WAKE',
+        table: payload.table,
+        eventType: payload.eventType,
+        roomVersion: payload.table === 'rooms' ? incomingVersion : current.room.version,
+        gameVersion: payload.table === 'room_games' ? incomingVersion : current.game?.version ?? null,
+        playerCount: current.players.length,
+        phase: current.game?.phase ?? null,
+        reason: incomingVersion !== null && incomingVersion <= knownVersion
+          ? 'STALE_OR_DUPLICATE'
+          : incomingVersion === null
+            ? 'UNVERSIONED_WAKE'
+            : 'NEWER_VERSION',
+      })
+      if (incomingVersion !== null && incomingVersion <= knownVersion) return
+      const reason = incomingVersion === null
+        ? `${payload.table}:${payload.eventType}:UNVERSIONED`
+        : incomingVersion > knownVersion + 1
+          ? `${payload.table}:${payload.eventType}:VERSION_GAP`
+          : `${payload.table}:${payload.eventType}:NEXT_VERSION`
+      void refreshSnapshot(reason)
+    }
+
+    if (E2E_EVENT_LOSS_CONTROL_ENABLED) {
+      const control = window.__BOM_SO_ONLINE_REALTIME_EVENT_LOSS__
+      if (control) {
+        control.inject = (change: DroppedRealtimeChange) => {
+          wakeFromPostgres({
+            schema: 'public',
+            table: change.table,
+            eventType: change.eventType,
+            new: change.new,
+            old: change.old,
+            commit_timestamp: new Date().toISOString(),
+            errors: [],
+          } as unknown as RealtimePostgresChangesPayload<Record<string, unknown>>)
+        }
+      }
+    }
+
+    const wakeFromPresence = (source: string) => {
+      const current = snapshotRef.current
+      traceOnlineConvergence({
+        clientInstanceId,
+        kind: 'PRESENCE_WAKE',
+        source,
+        roomVersion: current?.room?.version ?? null,
+        gameVersion: current?.game?.version ?? null,
+        playerCount: current?.players.length ?? 0,
+        phase: current?.game?.phase ?? null,
+      })
+      const control = E2E_EVENT_LOSS_CONTROL_ENABLED
+        ? window.__BOM_SO_ONLINE_REALTIME_EVENT_LOSS__
+        : undefined
+      if (!control?.suppressPresenceWake) void refreshSnapshot(`PRESENCE:${source}`)
+    }
+
+    channel
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'rooms',
+        filter: `id=eq.${room.id}`,
+        select: [
+          'id', 'code', 'status', 'host_player_id', 'max_players',
+          'turn_timeout_seconds', 'timeout_policy', 'starter_mode',
+          'show_live_selection', 'version', 'last_activity_at', 'expires_at',
+          'created_at', 'updated_at',
+        ],
+      }, wakeFromPostgres)
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'room_players',
+        filter: `room_id=eq.${room.id}`,
+        select: [
+          'id', 'room_id', 'nickname', 'seat', 'membership_status',
+          'joined_at', 'last_seen_at', 'left_at',
+        ],
+      }, wakeFromPostgres)
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'room_games',
+        filter: `room_id=eq.${room.id}`,
+        select: [
+          'id', 'room_id', 'round_number', 'phase', 'lower_candidate',
+          'upper_candidate', 'current_player_id', 'starting_player_id',
+          'turn_number', 'version', 'turn_started_at', 'turn_deadline_at',
+          'pending_locked_number', 'pending_actor_player_id',
+          'pending_action_origin', 'resolution_at', 'last_locked_number',
+          'last_actor_player_id', 'last_action_origin', 'last_outcome',
+          'loser_player_id', 'finish_reason', 'revealed_bomb_number',
+          'created_at', 'updated_at', 'finished_at',
+        ],
+      }, wakeFromPostgres)
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'game_players',
+        filter: `room_id=eq.${room.id}`,
+        select: [
+          'game_id', 'room_id', 'player_id', 'seat', 'timeout_strikes',
+          'participation_status', 'created_at',
+        ],
+      }, wakeFromPostgres)
+      .on('presence', { event: 'sync' }, () => {
+        const ids = new Set<string>()
+        const state = channel.presenceState<PresencePayload>()
+        for (const presences of Object.values(state)) {
+          for (const presence of presences) {
+            if (typeof presence.playerId === 'string') ids.add(presence.playerId)
+          }
+        }
+        setPresencePlayerIds(ids)
+        wakeFromPresence('SYNC')
+      })
+      .on('presence', { event: 'join' }, () => {
+        wakeFromPresence('JOIN')
+      })
+      .on('presence', { event: 'leave' }, ({ leftPresences }) => {
+        const leftIds = new Set(leftPresences
+          .map((presence) => (presence as Partial<PresencePayload>).playerId)
+          .filter((playerId): playerId is string => typeof playerId === 'string'))
+        setRemoteSelection((selection) => {
+          const nextSelection = selection && leftIds.has(selection.event.playerId)
+            ? null
+            : selection
+          remoteSelectionRef.current = nextSelection
+          return nextSelection
+        })
+        wakeFromPresence('LEAVE')
+      })
+      .on('broadcast', { event: 'player_selection_changed' }, ({ payload }) => {
+        const event = payload as RealtimeSelectionEvent
+        const current = snapshotRef.current
+        if (!current?.room || !current.game) return
+        const currentRemote = remoteSelectionRef.current
+        if (!isValidProvisionalSelection(event, {
+          room: current.room,
+          game: current.game,
+          players: current.players,
+          lastClientSeq: currentRemote?.event.playerId === event.playerId
+            ? currentRemote.event.clientSeq
+            : -1,
+          receivedAtMs: Date.now(),
+        })) return
+        expireRemoteSelection({ event, expiresAtMs: Date.now() + 5_000 })
+      })
+      .on('broadcast', { event: 'player_selection_cleared' }, ({ payload }) => {
+        const event = payload as RealtimeSelectionClearedEvent
+        const current = snapshotRef.current
+        if (!current?.game
+          || event.roomId !== current.room?.id
+          || event.gameId !== current.game.id
+          || event.gameVersion !== current.game.version
+        ) return
+        setRemoteSelection((selection) => {
+          if (selection
+            && selection.event.playerId === event.playerId
+            && event.clientSeq > selection.event.clientSeq
+          ) {
+            remoteSelectionRef.current = null
+            return null
+          }
+          return selection
+        })
+      })
+      .subscribe((status) => {
+        if (channelRef.current !== channel) return
+        traceOnlineConvergence({
+          clientInstanceId,
+          kind: 'CHANNEL_STATUS',
+          source: status,
+          roomVersion: snapshotRef.current?.room?.version ?? null,
+          gameVersion: snapshotRef.current?.game?.version ?? null,
+          playerCount: snapshotRef.current?.players.length ?? 0,
+          phase: snapshotRef.current?.game?.phase ?? null,
+        })
+        if (status === 'SUBSCRIBED') {
+          const payload: PresencePayload = {
+            playerId: selfPlayerId,
+            onlineSince: new Date().toISOString(),
+            clientInstanceId,
+          }
+          void channel.track(payload)
+          setConnection('connected')
+          void Promise.all([
+            refreshSnapshot('CHANNEL_SUBSCRIBED', 'HYDRATE'),
+            touchAndReconcile(client, room.id, 'CHANNEL_SUBSCRIBED', 'HYDRATE'),
+          ]).finally(() => {
+            if (channelRef.current === channel) activityHydrationPendingRef.current = false
+          })
+        } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+          activityHydrationPendingRef.current = true
+          setConnection('reconnecting')
+        } else if (status === 'CLOSED') {
+          activityHydrationPendingRef.current = true
+          setConnection('offline')
+        }
+      })
+  }, [
+    applyRealtimeGameState,
+    clientInstanceId,
+    expireRemoteSelection,
+    refreshSnapshot,
+    removeRoomChannel,
+    touchAndReconcile,
+  ])
+
+  const connectCanonicalResult = useCallback(async (result: OnlineRpcResult): Promise<boolean> => {
+    updateSnapshot(result, 'HYDRATE')
+    if (!isCanonicalResult(result)) return false
+    await subscribeToRoom(result)
+    return true
+  }, [subscribeToRoom, updateSnapshot])
+
+  const reconnect = useCallback(async (): Promise<boolean> => {
+    const client = clientRef.current
+    const pointer = readRoomPointer()
+    if (!client || !pointer) return false
+    setConnection('connecting')
+    const sentAt = Date.now()
+    const result = await onlineRpc.snapshot(client, pointer.roomId)
+    recordRpcClock(result, sentAt, Date.now())
+    if (TERMINAL_POINTER_CODES.has(result.code)) {
+      clearRoomPointer()
+      updateSnapshot(result)
+      setConnection('offline')
+      return false
+    }
+    return connectCanonicalResult(result)
+  }, [connectCanonicalResult, recordRpcClock, updateSnapshot])
+
+  useEffect(() => {
+    mountedRef.current = true
+    if (!config.available) return () => { mountedRef.current = false }
+    const client = getSupabaseClient()
+    clientRef.current = client
+    if (!client) {
+      setConnection('unavailable')
+      return () => { mountedRef.current = false }
+    }
+
+    void ensureAnonymousIdentity(client)
+      .then(async () => {
+        if (!mountedRef.current) return
+        setConnection('offline')
+        await reconnect()
+      })
+      .catch(() => {
+        if (mountedRef.current) setConnection('unavailable')
+      })
+
+    return () => {
+      mountedRef.current = false
+      removeRoomChannel()
+    }
+  }, [config.available, reconnect, removeRoomChannel])
+
+  useEffect(() => {
+    if (connection !== 'connected' || !activeRoomId) return
+    const roomId = activeRoomId
+    const intervalId = window.setInterval(() => {
+      const client = clientRef.current
+      if (client && document.visibilityState === 'visible') {
+        void touchAndReconcile(client, roomId, 'CONNECTION_HEARTBEAT')
+      }
+    }, 15_000)
+    return () => window.clearInterval(intervalId)
+  }, [activeRoomId, connection, touchAndReconcile])
+
+  useEffect(() => {
+    if (connection !== 'connected' || !activeRoomId) return
+    const phase = getAntiEntropyPhase(activeGamePhase)
+    const policy = getAntiEntropyPolicy(phase, E2E_EVENT_LOSS_CONTROL_ENABLED)
+    let timerId: number | null = null
+    let disposed = false
+    const schedule = () => {
+      traceOnlineConvergence({
+        clientInstanceId,
+        kind: 'ANTI_ENTROPY_SCHEDULED',
+        source: phase,
+        intervalMs: policy.intervalMs,
+        roomVersion: snapshotRef.current?.room?.version ?? null,
+        gameVersion: snapshotRef.current?.game?.version ?? null,
+        playerCount: snapshotRef.current?.players.length ?? 0,
+        phase: snapshotRef.current?.game?.phase ?? null,
+      })
+      timerId = window.setTimeout(async () => {
+        const before = snapshotRef.current
+        traceOnlineConvergence({
+          clientInstanceId,
+          kind: 'ANTI_ENTROPY_BEGIN',
+          source: phase,
+          roomVersion: before?.room?.version ?? null,
+          gameVersion: before?.game?.version ?? null,
+          playerCount: before?.players.length ?? 0,
+          phase: before?.game?.phase ?? null,
+        })
+        await refreshSnapshot(`ANTI_ENTROPY:${phase}`)
+        const after = snapshotRef.current
+        traceOnlineConvergence({
+          clientInstanceId,
+          kind: 'ANTI_ENTROPY_RESPONSE',
+          source: phase,
+          roomVersion: after?.room?.version ?? null,
+          gameVersion: after?.game?.version ?? null,
+          playerCount: after?.players.length ?? 0,
+          phase: after?.game?.phase ?? null,
+        })
+        if (after !== before) {
+          traceOnlineConvergence({
+            clientInstanceId,
+            kind: 'ANTI_ENTROPY_APPLIED',
+            source: phase,
+            roomVersion: after?.room?.version ?? null,
+            gameVersion: after?.game?.version ?? null,
+            playerCount: after?.players.length ?? 0,
+            phase: after?.game?.phase ?? null,
+          })
+        }
+        if (!disposed) schedule()
+      }, policy.intervalMs)
+    }
+    schedule()
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') void refreshSnapshot('VISIBILITY_RETURN')
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      disposed = true
+      if (timerId !== null) window.clearTimeout(timerId)
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+  }, [
+    clientInstanceId,
+    connection,
+    refreshSnapshot,
+    activeGamePhase,
+    activeRoomId,
+  ])
+
+  useEffect(() => {
+    remoteSelectionRef.current = null
+    setRemoteSelection(null)
+  }, [snapshot?.game?.currentPlayerId, snapshot?.game?.phase, snapshot?.game?.version])
+
+  const runEntryMutation = useCallback(async (
+    request: (client: SupabaseClient) => Promise<OnlineRpcResult>,
+  ): Promise<boolean> => {
+    const client = clientRef.current
+    if (!client) return false
+    setBusy(true)
+    setLastCode(null)
+    try {
+      const sentAt = Date.now()
+      const result = await request(client)
+      recordRpcClock(result, sentAt, Date.now())
+      if (result.code === 'ONLINE_UNAVAILABLE') setConnection('reconnecting')
+      return await connectCanonicalResult(result)
+    } finally {
+      if (mountedRef.current) setBusy(false)
+    }
+  }, [connectCanonicalResult, recordRpcClock])
+
+  const runRoomMutation = useCallback(async (
+    request: (client: SupabaseClient, current: OnlineRpcResult) => Promise<OnlineRpcResult>,
+  ): Promise<boolean> => {
+    const client = clientRef.current
+    const current = snapshotRef.current
+    if (!client || !current?.room) return false
+    setBusy(true)
+    setLastCode(null)
+    try {
+      const sentAt = Date.now()
+      const result = await request(client, current)
+      recordRpcClock(result, sentAt, Date.now())
+      if (result.code === 'ONLINE_UNAVAILABLE') setConnection('reconnecting')
+      updateSnapshot(result)
+      return result.ok
+    } finally {
+      if (mountedRef.current) setBusy(false)
+    }
+  }, [recordRpcClock, updateSnapshot])
+
+  const createRoom = useCallback((nickname: string, settings: OnlineRoomSettings) =>
+    runEntryMutation((client) => onlineRpc.createRoom(client, nickname, settings)), [runEntryMutation])
+
+  const joinRoom = useCallback((roomCode: string, nickname: string) =>
+    runEntryMutation((client) => onlineRpc.joinRoom(client, roomCode, nickname)), [runEntryMutation])
+
+  const updateSettings = useCallback((settings: OnlineRoomSettings) =>
+    runRoomMutation((client, current) => onlineRpc.updateSettings(
+      client,
+      current.room!.id,
+      current.room!.version,
+      settings,
+    )), [runRoomMutation])
+
+  const kickPlayer = useCallback((playerId: string) =>
+    runRoomMutation((client, current) => onlineRpc.kick(
+      client,
+      current.room!.id,
+      playerId,
+      current.room!.version,
+    )), [runRoomMutation])
+
+  const leaveRoom = useCallback(async () => {
+    await runRoomMutation((client, current) => onlineRpc.leave(client, current.room!.id))
+    clearRoomPointer()
+    removeRoomChannel()
+    snapshotRef.current = null
+    roomActivityLedger.reset()
+    setRoomActivities([])
+    setSnapshot(null)
+    setConnection('offline')
+  }, [removeRoomChannel, roomActivityLedger, runRoomMutation])
+
+  const claimHost = useCallback(() => runRoomMutation((client, current) =>
+    onlineRpc.claimHost(
+      client,
+      current.room!.id,
+      current.room!.hostPlayerId,
+      current.room!.version,
+    )), [runRoomMutation])
+
+  const startGame = useCallback(() => runRoomMutation((client, current) =>
+    onlineRpc.start(client, current.room!.id, current.room!.version)), [runRoomMutation])
+
+  const lockNumber = useCallback((candidate: number) => runRoomMutation((client, current) =>
+    onlineRpc.lock(
+      client,
+      current.room!.id,
+      current.game!.id,
+      current.game!.version,
+      candidate,
+    )), [runRoomMutation])
+
+  const resolveTimeout = useCallback(() => {
+    const current = snapshotRef.current
+    traceOnlineConvergence({
+      clientInstanceId,
+      kind: 'WATCHDOG_WAKE',
+      source: 'TURN_TIMEOUT',
+      roomVersion: current?.room?.version ?? null,
+      gameVersion: current?.game?.version ?? null,
+      playerCount: current?.players.length ?? 0,
+      phase: current?.game?.phase ?? null,
+    })
+    return runRoomMutation((client, canonical) => onlineRpc.timeout(
+      client,
+      canonical.room!.id,
+      canonical.game!.id,
+      canonical.game!.version,
+      canonical.game!.currentPlayerId,
+    ))
+  }, [clientInstanceId, runRoomMutation])
+
+  const finalizeResolution = useCallback(() => {
+    const current = snapshotRef.current
+    traceOnlineConvergence({
+      clientInstanceId,
+      kind: 'WATCHDOG_WAKE',
+      source: 'FINALIZE_RESOLUTION',
+      roomVersion: current?.room?.version ?? null,
+      gameVersion: current?.game?.version ?? null,
+      playerCount: current?.players.length ?? 0,
+      phase: current?.game?.phase ?? null,
+    })
+    return runRoomMutation((client, canonical) => onlineRpc.finalize(
+      client,
+      canonical.room!.id,
+      canonical.game!.id,
+      canonical.game!.version,
+    ))
+  }, [clientInstanceId, runRoomMutation])
+
+  const restartGame = useCallback(() => runRoomMutation((client, current) =>
+    onlineRpc.restart(client, current.room!.id, current.room!.version)), [runRoomMutation])
+
+  const returnToLobby = useCallback(() => runRoomMutation((client, current) =>
+    onlineRpc.lobby(client, current.room!.id, current.room!.version)), [runRoomMutation])
+
+  const broadcastSelection = useCallback(async (candidate: number) => {
+    const channel = channelRef.current
+    const current = snapshotRef.current
+    if (!channel || !current?.room || !current.game || !current.selfPlayerId) return
+    if (!current.room.settings.showLiveSelection
+      || current.game.currentPlayerId !== current.selfPlayerId
+      || current.game.phase !== 'PLAYING_TURN') return
+    selectionSeqRef.current += 1
+    const event: RealtimeSelectionEvent = {
+      v: 1,
+      roomId: current.room.id,
+      gameId: current.game.id,
+      gameVersion: current.game.version,
+      playerId: current.selfPlayerId,
+      candidate,
+      clientSeq: selectionSeqRef.current,
+      sentAt: new Date().toISOString(),
+    }
+    await channel.send({ type: 'broadcast', event: 'player_selection_changed', payload: event })
+  }, [])
+
+  const clearBroadcastSelection = useCallback(async () => {
+    const channel = channelRef.current
+    const current = snapshotRef.current
+    if (!channel || !current?.room || !current.game || !current.selfPlayerId) return
+    selectionSeqRef.current += 1
+    const event: RealtimeSelectionClearedEvent = {
+      v: 1,
+      roomId: current.room.id,
+      gameId: current.game.id,
+      gameVersion: current.game.version,
+      playerId: current.selfPlayerId,
+      clientSeq: selectionSeqRef.current,
+      sentAt: new Date().toISOString(),
+    }
+    await channel.send({ type: 'broadcast', event: 'player_selection_cleared', payload: event })
+  }, [])
+
+  const exitOnlineRoomLocally = useCallback(() => {
+    clearRoomPointer()
+    removeRoomChannel()
+    snapshotRef.current = null
+    roomActivityLedger.reset()
+    setRoomActivities([])
+    setSnapshot(null)
+    setLastCode(null)
+    setConnection(config.available ? 'offline' : 'unavailable')
+  }, [config.available, removeRoomChannel, roomActivityLedger])
+
+  const dismissRoomActivity = useCallback((activityId: string) => {
+    setRoomActivities((current) => current.filter((activity) => activity.id !== activityId))
+  }, [])
+
+  const value = useMemo<OnlineSessionValue>(() => ({
+    available: config.available,
+    configReason: config.reason,
+    connection,
+    snapshot,
+    busy,
+    lastCode,
+    presencePlayerIds,
+    remoteSelection,
+    liveGameTransitions,
+    roomActivities,
+    clock: clockRef.current,
+    createRoom,
+    joinRoom,
+    reconnect,
+    updateSettings,
+    kickPlayer,
+    leaveRoom,
+    claimHost,
+    startGame,
+    lockNumber,
+    resolveTimeout,
+    finalizeResolution,
+    restartGame,
+    returnToLobby,
+    refreshSnapshot,
+    broadcastSelection,
+    clearBroadcastSelection,
+    dismissRoomActivity,
+    clearLastCode: () => setLastCode(null),
+    exitOnlineRoomLocally,
+  }), [
+    broadcastSelection,
+    busy,
+    claimHost,
+    clearBroadcastSelection,
+    config.available,
+    config.reason,
+    connection,
+    createRoom,
+    dismissRoomActivity,
+    exitOnlineRoomLocally,
+    finalizeResolution,
+    joinRoom,
+    kickPlayer,
+    lastCode,
+    leaveRoom,
+    liveGameTransitions,
+    lockNumber,
+    presencePlayerIds,
+    reconnect,
+    refreshSnapshot,
+    remoteSelection,
+    roomActivities,
+    resolveTimeout,
+    restartGame,
+    returnToLobby,
+    snapshot,
+    startGame,
+    updateSettings,
+  ])
+
+  return (
+    <OnlineSessionContext.Provider value={value}>
+      {children}
+    </OnlineSessionContext.Provider>
+  )
+}

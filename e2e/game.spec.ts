@@ -146,8 +146,16 @@ async function readObservedResultDelay(page: Page): Promise<number> {
   })
 }
 
+async function enterLocalMode(page: Page) {
+  const startButton = page.getByRole('button', { name: /BẮT ĐẦU/u })
+  if (await startButton.isVisible()) return
+  await page.getByRole('button', { name: /CHƠI CÙNG NHAU/u }).click()
+  await expect(startButton).toBeVisible()
+}
+
 async function startGame(page: Page, playerCount = 2) {
   await page.goto('/')
+  await enterLocalMode(page)
   if (playerCount !== 2) {
     await page.getByRole('button', { name: new RegExp(`${playerCount} NGƯỜI`) }).click()
   }
@@ -178,6 +186,22 @@ async function expectBoardRange(page: Page, lower: number, upper: number) {
   await expect(board).toHaveAttribute('data-candidate-min', String(lower))
   await expect(board).toHaveAttribute('data-candidate-max', String(upper))
 }
+
+test('local mode starts without contacting the configured Supabase boundary', async ({ page }) => {
+  let supabaseRequestCount = 0
+  page.on('request', (request) => {
+    const url = new URL(request.url())
+    if (/\/(?:auth|rest|realtime)\/v1(?:\/|$)/u.test(url.pathname)) {
+      supabaseRequestCount += 1
+    }
+  })
+
+  await page.goto('/')
+  await enterLocalMode(page)
+  await page.getByRole('button', { name: 'BẮT ĐẦU' }).click()
+  await expect(page.getByTestId('number-board')).toBeVisible()
+  expect(supabaseRequestCount).toBe(0)
+})
 
 test('completes a two-player game and records the loser', async ({ page }) => {
   await startGame(page)
@@ -559,6 +583,7 @@ test('fresh mobile reload has no React dependency warning or page error', async 
 
   await page.setViewportSize({ width: 393, height: 852 })
   await page.goto('/')
+  await enterLocalMode(page)
   await page.reload({ waitUntil: 'domcontentloaded' })
   await page.getByRole('button', { name: 'BẮT ĐẦU' }).click()
   await chooseSafe(page, 25)
@@ -655,6 +680,7 @@ test('haptics toggle persists independently and disabled mode emits no event fee
 }) => {
   await installHapticsMock(page)
   await page.goto('/')
+  await enterLocalMode(page)
   await page.getByRole('button', { name: 'Tắt rung' }).click()
   expect(await page.evaluate(() => localStorage.getItem('bom-so:haptics'))).toBe('false')
 
@@ -703,6 +729,7 @@ test('mute preference persists across reloads', async ({ page }) => {
 test('muted BOOM stays silent and does not replay after restart and unmute', async ({ page }) => {
   await page.goto('/')
   await setAudioMuted(page, true)
+  await enterLocalMode(page)
   await page.getByRole('button', { name: 'BẮT ĐẦU' }).click()
   await chooseAndLock(page, 81)
   await expect(page.getByTestId('boom-result')).toBeVisible()
@@ -743,6 +770,7 @@ test('start lifecycle contract has no page errors with audio, mute, starter, and
 
   for (const scenario of cases) {
     await page.goto('/')
+    await enterLocalMode(page)
     await setAudioMuted(page, scenario.muted)
     if (scenario.players !== 2) {
       await page
@@ -771,6 +799,7 @@ test('20 mixed start, replay, mute, and setup cycles stay clean', async ({ page 
   const pageErrors: string[] = []
   page.on('pageerror', (error) => pageErrors.push(error.message))
   await page.goto('/')
+  await enterLocalMode(page)
 
   for (let cycle = 1; cycle <= 20; cycle += 1) {
     const players = 2 + ((cycle - 1) % 3)
