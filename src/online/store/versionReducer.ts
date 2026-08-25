@@ -24,24 +24,53 @@ export function shouldApplyCanonicalSnapshot(
   current: OnlineRpcResult | null,
   incoming: OnlineRpcResult,
 ): boolean {
-  if (!current?.room) return true
-  if (!incoming.room) return incoming.code !== 'ONLINE_UNAVAILABLE'
-  if (incoming.room.id !== current.room.id) return true
+  return reconcileCanonicalSnapshot(current, incoming) !== current
+}
 
-  if (incoming.room.version !== current.room.version) {
-    return incoming.room.version > current.room.version
+export function reconcileCanonicalSnapshot(
+  current: OnlineRpcResult | null,
+  incoming: OnlineRpcResult,
+): OnlineRpcResult {
+  if (!current?.room) return incoming
+  if (!incoming.room) return incoming.code === 'ONLINE_UNAVAILABLE' ? current : incoming
+  if (incoming.room.id !== current.room.id) return incoming
+
+  const roomComparison = Math.sign(incoming.room.version - current.room.version)
+  const bothWithoutGame = !current.game && !incoming.game
+  const sameGame = Boolean(current.game && incoming.game && current.game.id === incoming.game.id)
+
+  if (!sameGame && !bothWithoutGame) {
+    return roomComparison > 0 ? incoming : current
   }
 
-  if (
-    current.game
-    && incoming.game
-    && current.game.id === incoming.game.id
-    && incoming.game.version < current.game.version
-  ) {
-    return false
-  }
+  const gameComparison = bothWithoutGame
+    ? 0
+    : sameGame
+    ? Math.sign(incoming.game!.version - current.game!.version)
+    : incoming.game
+      ? 1
+      : current.game
+        ? -1
+        : 0
 
-  return true
+  if (roomComparison < 0 && gameComparison <= 0) return current
+  if (roomComparison === 0 && gameComparison < 0) return current
+
+  const roomSource = roomComparison < 0 ? current : incoming
+  const gameSource = gameComparison < 0 ? current : incoming
+
+  if (roomSource === current && gameSource === current) return current
+  if (roomSource === incoming && gameSource === incoming) return incoming
+
+  return {
+    ...incoming,
+    selfPlayerId: roomSource.selfPlayerId,
+    room: roomSource.room,
+    players: roomSource.players,
+    game: gameSource.game,
+    gamePlayers: gameSource.gamePlayers,
+    action: gameSource.action,
+  }
 }
 
 export function reduceCanonicalVersion(

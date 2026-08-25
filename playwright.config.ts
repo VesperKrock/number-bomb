@@ -3,6 +3,9 @@ import { defineConfig, devices } from '@playwright/test'
 export default defineConfig({
   testDir: './e2e',
   fullyParallel: false,
+  // Online specs share one repo-local Supabase stack. Keep repeated two-device
+  // flows serial so they exercise convergence rather than saturating Realtime/Auth.
+  workers: 1,
   timeout: 20_000,
   expect: { timeout: 5_000 },
   reporter: [['list'], ['html', { open: 'never' }]],

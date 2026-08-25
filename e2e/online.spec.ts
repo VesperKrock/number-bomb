@@ -1,9 +1,26 @@
 import { execFileSync } from 'node:child_process'
-import { expect, test, type BrowserContext, type Page } from '@playwright/test'
+import { expect, test, type BrowserContext, type Page, type TestInfo } from '@playwright/test'
 
 interface AudioDiagnostics {
   activeRingingSources: number
   lastBoomImpactGain: number | null
+}
+
+interface ConvergenceDiagnostic {
+  sequence: number
+  clientInstanceId: string
+  kind: string
+  atMs: number
+  source?: string
+  table?: string
+  eventType?: string
+  requestGeneration?: number
+  roomVersion?: number | null
+  gameVersion?: number | null
+  playerCount?: number
+  phase?: string | null
+  reason?: string
+  presentationKey?: string
 }
 
 type HapticCall = number | number[]
@@ -47,9 +64,37 @@ async function readAudioDiagnostics(page: Page): Promise<AudioDiagnostics> {
   })
 }
 
+async function attachConvergenceDiagnostics(
+  testInfo: TestInfo,
+  label: string,
+  pages: ReadonlyArray<{ name: string; page: Page }>,
+): Promise<void> {
+  const diagnostics = await Promise.all(pages.map(async ({ name, page }) => ({
+    name,
+    url: page.url(),
+    events: await page.evaluate(() => (
+      window as typeof window & {
+        __BOM_SO_ONLINE_CONVERGENCE_DIAGNOSTICS__?: ConvergenceDiagnostic[]
+      }
+    ).__BOM_SO_ONLINE_CONVERGENCE_DIAGNOSTICS__ ?? []),
+  })))
+  await testInfo.attach(`convergence-${label}`, {
+    body: JSON.stringify(diagnostics, null, 2),
+    contentType: 'application/json',
+  })
+}
+
+async function readConvergenceDiagnostics(page: Page): Promise<ConvergenceDiagnostic[]> {
+  return page.evaluate(() => (
+    window as typeof window & {
+      __BOM_SO_ONLINE_CONVERGENCE_DIAGNOSTICS__?: ConvergenceDiagnostic[]
+    }
+  ).__BOM_SO_ONLINE_CONVERGENCE_DIAGNOSTICS__ ?? [])
+}
+
 async function observeResultOnset(page: Page, selector: string): Promise<void> {
   await page.evaluate((resultSelector) => {
-    const state = { observedAt: null as number | null }
+    const state = { observedAt: null as number | null, textContent: null as string | null }
     ;(
       window as typeof window & {
         __BOM_SO_ONLINE_RESULT_ONSET__?: typeof state
@@ -57,8 +102,10 @@ async function observeResultOnset(page: Page, selector: string): Promise<void> {
     ).__BOM_SO_ONLINE_RESULT_ONSET__ = state
 
     const capture = () => {
-      if (!document.querySelector(resultSelector)) return false
+      const result = document.querySelector(resultSelector)
+      if (!result) return false
       state.observedAt = Date.now()
+      state.textContent = result.textContent
       return true
     }
     if (capture()) return
@@ -82,6 +129,14 @@ async function readResultOnset(page: Page): Promise<number | null> {
       __BOM_SO_ONLINE_RESULT_ONSET__?: { observedAt: number | null }
     }
   ).__BOM_SO_ONLINE_RESULT_ONSET__?.observedAt ?? null)
+}
+
+async function readResultText(page: Page): Promise<string | null> {
+  return page.evaluate(() => (
+    window as typeof window & {
+      __BOM_SO_ONLINE_RESULT_ONSET__?: { textContent: string | null }
+    }
+  ).__BOM_SO_ONLINE_RESULT_ONSET__?.textContent ?? null)
 }
 
 async function expectSynchronizedOnset(left: Page, right: Page): Promise<void> {
@@ -161,13 +216,19 @@ async function createOnlinePage(context: BrowserContext): Promise<Page> {
   return page
 }
 
-test('two isolated devices synchronize lobby, SAFE, reconnect, and victim/spectator BOOM', async ({ browser }) => {
+test('two isolated devices synchronize lobby, SAFE, reconnect, and victim/spectator BOOM', async ({ browser }, testInfo) => {
   test.setTimeout(45_000)
   const hostContext = await browser.newContext({
     viewport: { width: 390, height: 844 },
     reducedMotion: 'reduce',
   })
   const peerContext = await browser.newContext()
+  await hostContext.addInitScript(() => {
+    window.__BOM_SO_ONLINE_CONVERGENCE_DIAGNOSTICS__ = []
+  })
+  await peerContext.addInitScript(() => {
+    window.__BOM_SO_ONLINE_CONVERGENCE_DIAGNOSTICS__ = []
+  })
   const host = await createOnlinePage(hostContext)
 
   await host.getByLabel('BIỆT DANH').fill('Thiên An')
@@ -183,8 +244,16 @@ test('two isolated devices synchronize lobby, SAFE, reconnect, and victim/specta
   await peer.getByLabel('BIỆT DANH').fill('Minh Khoa')
   await peer.getByRole('button', { name: 'THAM GIA PHÒNG' }).click()
 
-  await expect(host.getByTestId('online-roster-player')).toHaveCount(2)
-  await expect(peer.getByTestId('online-roster-player')).toHaveCount(2)
+  try {
+    await expect(host.getByTestId('online-roster-player')).toHaveCount(2)
+    await expect(peer.getByTestId('online-roster-player')).toHaveCount(2)
+  } catch (error) {
+    await attachConvergenceDiagnostics(testInfo, 'roster-failure', [
+      { name: 'host', page: host },
+      { name: 'peer', page: peer },
+    ])
+    throw error
+  }
   const startButton = host.getByRole('button', { name: 'BẮT ĐẦU ONLINE' })
   await expect(startButton).toBeEnabled()
   await startButton.click()
@@ -205,8 +274,16 @@ test('two isolated devices synchronize lobby, SAFE, reconnect, and victim/specta
   await host.getByRole('button', { name: 'KHÓA SỐ' }).focus()
   await host.keyboard.press('Enter')
 
-  await expect(host.getByRole('heading', { name: 'AN TOÀN' })).toBeAttached()
-  await expect(peer.getByRole('heading', { name: 'AN TOÀN' })).toBeAttached()
+  try {
+    await expect.poll(() => readResultText(host)).toContain('AN TOÀN')
+    await expect.poll(() => readResultText(peer)).toContain('AN TOÀN')
+  } catch (error) {
+    await attachConvergenceDiagnostics(testInfo, 'safe-failure', [
+      { name: 'host', page: host },
+      { name: 'peer', page: peer },
+    ])
+    throw error
+  }
   await expect(host.getByTestId('online-valid-range')).toContainText('26')
   await expect(peer.getByTestId('online-valid-range')).toContainText('26')
   await expect(host.getByTestId('online-current-player')).toHaveText('Minh Khoa')
@@ -254,6 +331,70 @@ test('two isolated devices synchronize lobby, SAFE, reconnect, and victim/specta
 
   await hostContext.close()
   await peerContext.close()
+})
+
+test('a Postgres wake during bootstrap snapshot drains into a newer roster snapshot', async ({ browser }) => {
+  test.setTimeout(30_000)
+  const hostContext = await browser.newContext()
+  const peerContext = await browser.newContext()
+  await hostContext.addInitScript(() => {
+    window.__BOM_SO_ONLINE_CONVERGENCE_DIAGNOSTICS__ = []
+  })
+
+  const host = await createOnlinePage(hostContext)
+  let markSnapshotCaptured!: () => void
+  const snapshotCaptured = new Promise<void>((resolve) => { markSnapshotCaptured = resolve })
+  let releaseSnapshot!: () => void
+  const snapshotRelease = new Promise<void>((resolve) => { releaseSnapshot = resolve })
+  let holdFirstSnapshot = true
+
+  await host.route('**/rest/v1/rpc/get_room_snapshot', async (route) => {
+    if (!holdFirstSnapshot) {
+      await route.continue()
+      return
+    }
+    holdFirstSnapshot = false
+    const response = await route.fetch()
+    markSnapshotCaptured()
+    await snapshotRelease
+    await route.fulfill({ response })
+  })
+
+  await host.getByLabel('BIỆT DANH').fill('Bootstrap Host')
+  await host.getByRole('button', { name: 'TẠO PHÒNG', exact: true }).last().click()
+  await expect(host.getByRole('heading', { name: 'CHỜ NGƯỜI CHƠI' })).toBeVisible()
+  const roomCode = (await host.locator('.room-share-card strong').textContent())?.trim() ?? ''
+  await snapshotCaptured
+
+  const peer = await peerContext.newPage()
+  await installHapticsMock(peer)
+  await peer.goto(`/?room=${roomCode}`)
+  await peer.getByLabel('BIỆT DANH').fill('Bootstrap Peer')
+  await peer.getByRole('button', { name: 'THAM GIA PHÒNG' }).click()
+  await expect(peer.getByTestId('online-roster-player')).toHaveCount(2)
+
+  await expect.poll(async () => {
+    const events = await readConvergenceDiagnostics(host)
+    return {
+      playerInsert: events.some((event) => event.kind === 'POSTGRES_WAKE'
+        && event.table === 'room_players'
+        && event.eventType === 'INSERT'),
+      roomVersion: events.some((event) => event.kind === 'POSTGRES_WAKE'
+        && event.table === 'rooms'
+        && event.roomVersion === 2),
+      coalesced: events.some((event) => event.kind === 'SNAPSHOT_COALESCED'
+        && event.reason === 'TRAILING_RECOVERY_QUEUED'),
+    }
+  }).toEqual({ playerInsert: true, roomVersion: true, coalesced: true })
+
+  await peerContext.close()
+  releaseSnapshot()
+  await expect(host.getByTestId('online-roster-player')).toHaveCount(2)
+  await expect.poll(async () => (await readConvergenceDiagnostics(host)).filter(
+    (event) => event.kind === 'SNAPSHOT_REQUEST',
+  ).length).toBeGreaterThanOrEqual(2)
+
+  await hostContext.close()
 })
 
 test('four isolated devices keep canonical turn restrictions and seat rotation', async ({ browser }) => {

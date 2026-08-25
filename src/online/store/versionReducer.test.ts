@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { OnlineRpcResult } from '../types'
 import {
   emptyCanonicalOnlineState,
+  reconcileCanonicalSnapshot,
   reduceCanonicalVersion,
   shouldApplyCanonicalSnapshot,
 } from './versionReducer'
@@ -77,7 +78,9 @@ describe('canonical online version reducer', () => {
 
   it('never downgrades canonical state or drops it for a network envelope', () => {
     const current = snapshot(8, 13)
-    expect(shouldApplyCanonicalSnapshot(current, snapshot(7, 99))).toBe(false)
+    const olderRoomNewerGame = reconcileCanonicalSnapshot(current, snapshot(7, 99))
+    expect(olderRoomNewerGame.room?.version).toBe(8)
+    expect(olderRoomNewerGame.game?.version).toBe(99)
     expect(shouldApplyCanonicalSnapshot(current, snapshot(8, 12))).toBe(false)
     expect(shouldApplyCanonicalSnapshot(current, snapshot(8, 14))).toBe(true)
     expect(shouldApplyCanonicalSnapshot(current, snapshot(9, 1))).toBe(true)
@@ -88,5 +91,43 @@ describe('canonical online version reducer', () => {
       room: null,
       game: null,
     })).toBe(false)
+  })
+
+  it('reconciles room and game version axes without allowing either to regress', () => {
+    const current = snapshot(8, 13)
+    const newerRoomOlderGame = snapshot(9, 12)
+    newerRoomOlderGame.players = [{
+      id: 'peer',
+      roomId: 'room',
+      nickname: 'Peer',
+      seat: 2,
+      membershipStatus: 'ACTIVE',
+      joinedAt: '',
+      lastSeenAt: '',
+    }]
+
+    const reconciledRoom = reconcileCanonicalSnapshot(current, newerRoomOlderGame)
+    expect(reconciledRoom.room?.version).toBe(9)
+    expect(reconciledRoom.players).toHaveLength(1)
+    expect(reconciledRoom.game?.version).toBe(13)
+
+    const olderRoomNewerGame = snapshot(7, 14)
+    const reconciledGame = reconcileCanonicalSnapshot(reconciledRoom, olderRoomNewerGame)
+    expect(reconciledGame.room?.version).toBe(9)
+    expect(reconciledGame.players).toHaveLength(1)
+    expect(reconciledGame.game?.version).toBe(14)
+  })
+
+  it('accepts canonical game creation/removal only with a newer room transition', () => {
+    const playing = snapshot(8, 13)
+    const lobby = { ...snapshot(9, 0), game: null }
+    expect(reconcileCanonicalSnapshot(playing, lobby)).toBe(lobby)
+
+    const staleLobby = { ...snapshot(8, 0), game: null }
+    expect(reconcileCanonicalSnapshot(playing, staleLobby)).toBe(playing)
+
+    const newerRound = snapshot(10, 1)
+    newerRound.game = { ...newerRound.game!, id: 'next-game' }
+    expect(reconcileCanonicalSnapshot(playing, newerRound)).toBe(newerRound)
   })
 })

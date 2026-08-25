@@ -6,6 +6,7 @@ import type {
   OnlineRpcResult,
   RealtimeSelectionEvent,
 } from '../types'
+import type { LiveGameTransition } from './liveGameTransition'
 
 export interface RemoteSelection {
   event: RealtimeSelectionEvent
@@ -21,6 +22,7 @@ export interface OnlineSessionValue {
   lastCode: OnlineRpcResult['code'] | null
   presencePlayerIds: ReadonlySet<string>
   remoteSelection: RemoteSelection | null
+  liveGameTransitions: readonly LiveGameTransition[]
   clock: ServerClock
   createRoom: (nickname: string, settings: OnlineRoomSettings) => Promise<boolean>
   joinRoom: (roomCode: string, nickname: string) => Promise<boolean>

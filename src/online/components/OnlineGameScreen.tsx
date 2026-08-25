@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { GameAudioControls } from '../../audio/useGameAudio'
 import { FinalCandidate } from '../../components/FinalCandidate'
 import { LockConfirmation } from '../../components/LockConfirmation'
@@ -8,6 +8,7 @@ import { getTensionProfile } from '../../presentation/tension'
 import { SAFE_FEEDBACK_DURATION } from '../../presentation/timings'
 import { PresentationLedger, presentationKey } from '../presentationLedger'
 import { useOnlineSession } from '../store/useOnlineSession'
+import { traceOnlineConvergence } from '../store/convergenceDiagnostics'
 import { getCandidateCount } from '../types'
 import { OnlineResolutionOverlay } from './OnlineResolutionOverlay'
 import { OnlineResult } from './OnlineResult'
@@ -47,6 +48,7 @@ export function OnlineGameScreen({ audio, haptics, onBackHome }: OnlineGameScree
   const previousGameRef = useRef<PreviousCanonicalGame | null>(null)
   const timeoutAttemptRef = useRef<string | null>(null)
   const finalizeAttemptRef = useRef<string | null>(null)
+  const safeFeedbackTimerRef = useRef<number | null>(null)
   const isCurrentPlayer = game.currentPlayerId === selfPlayerId
   const isHost = room.hostPlayerId === selfPlayerId
   const currentMembership = snapshot.players.find((player) => player.id === selfPlayerId)
@@ -64,6 +66,55 @@ export function OnlineGameScreen({ audio, haptics, onBackHome }: OnlineGameScree
   const liveSelectionCopy = session.remoteSelection && remoteActor
     ? `${remoteActor.nickname} đang chọn số ${session.remoteSelection.event.candidate}`
     : null
+
+  const presentSafe = useCallback((
+    gameId: string,
+    version: number,
+    lockedNumber: number | null,
+  ) => {
+    const key = presentationKey(gameId, version, 'SAFE')
+    if (!ledgerRef.current.consume(key)) return
+    traceOnlineConvergence({
+      clientInstanceId: selfPlayerId,
+      kind: 'PRESENTATION_CONSUMED',
+      source: 'CANONICAL_LIVE_TRANSITION',
+      gameVersion: version,
+      phase: 'PLAYING_TURN',
+      presentationKey: key,
+    })
+    setSafeNumber(lockedNumber)
+    audio.playSafe()
+    haptics.triggerHaptic('safe')
+    if (safeFeedbackTimerRef.current !== null) {
+      window.clearTimeout(safeFeedbackTimerRef.current)
+    }
+    safeFeedbackTimerRef.current = window.setTimeout(() => {
+      safeFeedbackTimerRef.current = null
+      setSafeNumber(null)
+    }, SAFE_FEEDBACK_DURATION)
+  }, [audio, haptics, selfPlayerId])
+
+  const presentBoom = useCallback((
+    gameId: string,
+    version: number,
+    loserPlayerId: string | null,
+  ) => {
+    const key = presentationKey(gameId, version, 'BOOM')
+    if (!ledgerRef.current.consume(key)) return
+    const variant = loserPlayerId === selfPlayerId ? 'victim' : 'spectator'
+    traceOnlineConvergence({
+      clientInstanceId: selfPlayerId,
+      kind: 'PRESENTATION_CONSUMED',
+      source: 'CANONICAL_LIVE_TRANSITION',
+      gameVersion: version,
+      phase: 'FINISHED',
+      presentationKey: key,
+    })
+    audio.stopSoundscape()
+    setLiveImpact(true)
+    audio.playExplosion(tension, variant)
+    haptics.triggerHaptic(variant === 'victim' ? 'boom' : 'boomSpectator')
+  }, [audio, haptics, selfPlayerId, tension])
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -116,6 +167,16 @@ export function OnlineGameScreen({ audio, haptics, onBackHome }: OnlineGameScree
     const previous = previousGameRef.current
     const isSameGame = previous?.id === game.id
     const isLiveTransition = Boolean(isSameGame && previous && game.version > previous.version)
+    const clientInstanceId = selfPlayerId
+    traceOnlineConvergence({
+      clientInstanceId,
+      kind: 'PRESENTATION_OBSERVED',
+      source: previous ? `${previous.phase}:${previous.version}` : 'HYDRATED',
+      roomVersion: room.version,
+      gameVersion: game.version,
+      playerCount: snapshot.players.length,
+      phase: game.phase,
+    })
 
     if (game.phase === 'RESOLVING') {
       audio.duckSoundscape()
@@ -123,33 +184,50 @@ export function OnlineGameScreen({ audio, haptics, onBackHome }: OnlineGameScree
         && previous?.phase === 'PLAYING_TURN'
         && ledgerRef.current.consume(presentationKey(game.id, game.version, 'LOCK'))
       ) {
+        traceOnlineConvergence({
+          clientInstanceId,
+          kind: 'PRESENTATION_CONSUMED',
+          gameVersion: game.version,
+          phase: game.phase,
+          presentationKey: presentationKey(game.id, game.version, 'LOCK'),
+        })
         audio.playLock(tension)
       }
     } else if (game.phase === 'PLAYING_TURN') {
       if (isLiveTransition
         && previous?.phase === 'RESOLVING'
         && game.lastOutcome === 'SAFE'
-        && ledgerRef.current.consume(presentationKey(game.id, game.version, 'SAFE'))
       ) {
-        setSafeNumber(game.lastLockedNumber)
-        audio.playSafe()
-        haptics.triggerHaptic('safe')
-        const timer = window.setTimeout(() => setSafeNumber(null), SAFE_FEEDBACK_DURATION)
-        previousGameRef.current = { id: game.id, phase: game.phase, version: game.version }
-        return () => window.clearTimeout(timer)
+        presentSafe(
+          game.id,
+          game.version,
+          game.lastLockedNumber,
+        )
       }
-      setSafeNumber(null)
-      setLiveImpact(false)
+      if (game.lastOutcome === 'SAFE' && !isLiveTransition) {
+        traceOnlineConvergence({
+          clientInstanceId,
+          kind: 'PRESENTATION_SKIPPED',
+          gameVersion: game.version,
+          phase: game.phase,
+          reason: previous ? 'NOT_A_NEWER_LIVE_TRANSITION' : 'HYDRATED_SETTLED_STATE',
+          presentationKey: presentationKey(game.id, game.version, 'SAFE'),
+        })
+      }
+      if (!isSameGame || previous?.phase === 'FINISHED') {
+        setSafeNumber(null)
+        setLiveImpact(false)
+      }
     } else if (game.phase === 'FINISHED') {
       audio.stopSoundscape()
       if (isLiveTransition
         && previous?.phase === 'RESOLVING'
-        && ledgerRef.current.consume(presentationKey(game.id, game.version, 'BOOM'))
       ) {
-        const variant = game.loserPlayerId === selfPlayerId ? 'victim' : 'spectator'
-        setLiveImpact(true)
-        audio.playExplosion(tension, variant)
-        haptics.triggerHaptic(variant === 'victim' ? 'boom' : 'boomSpectator')
+        presentBoom(
+          game.id,
+          game.version,
+          game.loserPlayerId,
+        )
       }
     }
 
@@ -161,9 +239,61 @@ export function OnlineGameScreen({ audio, haptics, onBackHome }: OnlineGameScree
     game.lastOutcome,
     game.loserPlayerId,
     game.phase,
+    game.updatedAt,
     game.version,
     haptics,
+    room.version,
+    presentBoom,
+    presentSafe,
     selfPlayerId,
+    snapshot.players.length,
+    tension,
+  ])
+
+  useEffect(() => {
+    const eligibleTransitions = session.liveGameTransitions.filter((transition) => (
+      transition.gameId === game.id
+    ))
+
+    for (const transition of eligibleTransitions) {
+      const key = presentationKey(game.id, transition.version, transition.kind)
+      if (transition.kind === 'LOCK') {
+        if (!ledgerRef.current.consume(key)) continue
+        traceOnlineConvergence({
+          clientInstanceId: selfPlayerId,
+          kind: 'PRESENTATION_CONSUMED',
+          source: 'LIVE_POSTGRES_TRANSITION',
+          roomVersion: room.version,
+          gameVersion: transition.version,
+          playerCount: snapshot.players.length,
+          phase: transition.phase,
+          presentationKey: key,
+        })
+        audio.duckSoundscape()
+        audio.playLock(tension)
+      } else if (transition.kind === 'SAFE') {
+        presentSafe(
+          transition.gameId,
+          transition.version,
+          transition.lockedNumber,
+        )
+      } else {
+        presentBoom(
+          transition.gameId,
+          transition.version,
+          transition.loserPlayerId,
+        )
+      }
+    }
+  }, [
+    audio,
+    game.id,
+    room.version,
+    presentBoom,
+    presentSafe,
+    selfPlayerId,
+    session.liveGameTransitions,
+    snapshot.players.length,
     tension,
   ])
 
@@ -174,6 +304,10 @@ export function OnlineGameScreen({ audio, haptics, onBackHome }: OnlineGameScree
   }, [audio, game.phase, safeNumber, tension, turnHasStarted])
 
   useEffect(() => () => {
+    if (safeFeedbackTimerRef.current !== null) {
+      window.clearTimeout(safeFeedbackTimerRef.current)
+      safeFeedbackTimerRef.current = null
+    }
     audio.cleanupSession()
     haptics.cancelHaptics()
   }, [audio, haptics])
@@ -205,12 +339,25 @@ export function OnlineGameScreen({ audio, haptics, onBackHome }: OnlineGameScree
 
   const loser = snapshot.players.find((player) => player.id === game.loserPlayerId)
   const resultVariant = game.loserPlayerId === selfPlayerId ? 'victim' : 'spectator'
-  const renderLiveImpact = liveImpact || (
+  const resultPresentationKey = presentationKey(game.id, game.version, 'BOOM')
+  const isNewLiveBoom = (
     previousGameRef.current?.id === game.id
-    && previousGameRef.current.phase === 'RESOLVING'
+    && previousGameRef.current.phase !== 'FINISHED'
     && game.phase === 'FINISHED'
     && game.version > previousGameRef.current.version
   )
+  const hasBufferedLiveBoom = session.liveGameTransitions.some((transition) => (
+    transition.gameId === game.id
+    && transition.version === game.version
+    && transition.kind === 'BOOM'
+  ))
+  const isAwaitingLiveBoom = game.phase === 'FINISHED'
+    && !ledgerRef.current.has(resultPresentationKey)
+    && (
+      isNewLiveBoom
+      || hasBufferedLiveBoom
+    )
+  const renderLiveImpact = liveImpact
 
   return (
     <main
@@ -276,7 +423,7 @@ export function OnlineGameScreen({ audio, haptics, onBackHome }: OnlineGameScree
 
       <OnlineResolutionOverlay pending={game.phase === 'RESOLVING' ? game.pending : null} safeNumber={safeNumber} />
 
-      {game.phase === 'FINISHED' && loser && game.finishReason && (
+      {game.phase === 'FINISHED' && !isAwaitingLiveBoom && loser && game.finishReason && (
         <OnlineResult
           game={game}
           loserName={loser.nickname}
