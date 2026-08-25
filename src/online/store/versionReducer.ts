@@ -53,6 +53,24 @@ export function reconcileCanonicalSnapshot(
         ? -1
         : 0
 
+  if (roomComparison === 0
+    && gameComparison === 0
+    && JSON.stringify({
+      selfPlayerId: current.selfPlayerId,
+      room: current.room,
+      players: current.players,
+      game: current.game,
+      gamePlayers: current.gamePlayers,
+      action: current.action,
+    }) === JSON.stringify({
+      selfPlayerId: incoming.selfPlayerId,
+      room: incoming.room,
+      players: incoming.players,
+      game: incoming.game,
+      gamePlayers: incoming.gamePlayers,
+      action: incoming.action,
+    })
+  ) return current
   if (roomComparison < 0 && gameComparison <= 0) return current
   if (roomComparison === 0 && gameComparison < 0) return current
 

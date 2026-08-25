@@ -78,6 +78,7 @@ describe('canonical online version reducer', () => {
 
   it('never downgrades canonical state or drops it for a network envelope', () => {
     const current = snapshot(8, 13)
+    expect(reconcileCanonicalSnapshot(current, snapshot(8, 13))).toBe(current)
     const olderRoomNewerGame = reconcileCanonicalSnapshot(current, snapshot(7, 99))
     expect(olderRoomNewerGame.room?.version).toBe(8)
     expect(olderRoomNewerGame.game?.version).toBe(99)
@@ -116,6 +117,24 @@ describe('canonical online version reducer', () => {
     expect(reconciledGame.room?.version).toBe(9)
     expect(reconciledGame.players).toHaveLength(1)
     expect(reconciledGame.game?.version).toBe(14)
+  })
+
+  it('accepts same-version auxiliary membership freshness without rerendering identical payloads', () => {
+    const current = snapshot(8, 13)
+    current.players = [{
+      id: 'peer',
+      roomId: 'room',
+      nickname: 'Peer',
+      seat: 2,
+      membershipStatus: 'ACTIVE',
+      joinedAt: '',
+      lastSeenAt: '2026-08-25T00:00:00.000Z',
+    }]
+    expect(reconcileCanonicalSnapshot(current, structuredClone(current))).toBe(current)
+
+    const touched = structuredClone(current)
+    touched.players[0].lastSeenAt = '2026-08-25T00:00:15.000Z'
+    expect(reconcileCanonicalSnapshot(current, touched)).toBe(touched)
   })
 
   it('accepts canonical game creation/removal only with a newer room transition', () => {

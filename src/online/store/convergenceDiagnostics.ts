@@ -1,6 +1,14 @@
 export type OnlineConvergenceDiagnosticKind =
   | 'CHANNEL_STATUS'
   | 'POSTGRES_WAKE'
+  | 'REALTIME_EVENT_DROPPED_TEST_ONLY'
+  | 'PRESENCE_WAKE'
+  | 'HEARTBEAT_RESPONSE_APPLIED'
+  | 'WATCHDOG_WAKE'
+  | 'ANTI_ENTROPY_SCHEDULED'
+  | 'ANTI_ENTROPY_BEGIN'
+  | 'ANTI_ENTROPY_RESPONSE'
+  | 'ANTI_ENTROPY_APPLIED'
   | 'SNAPSHOT_COALESCED'
   | 'SNAPSHOT_REQUEST'
   | 'SNAPSHOT_RESPONSE'
@@ -25,6 +33,7 @@ export interface OnlineConvergenceDiagnostic {
   phase?: string | null
   reason?: string
   presentationKey?: string
+  intervalMs?: number
 }
 
 declare global {

@@ -6,6 +6,7 @@ import { NumberBoard } from '../../components/NumberBoard'
 import type { GameHapticsControls } from '../../presentation/useGameHaptics'
 import { getTensionProfile } from '../../presentation/tension'
 import { SAFE_FEEDBACK_DURATION } from '../../presentation/timings'
+import { isLivePresentationFresh } from '../presentationFreshness'
 import { PresentationLedger, presentationKey } from '../presentationLedger'
 import { useOnlineSession } from '../store/useOnlineSession'
 import { traceOnlineConvergence } from '../store/convergenceDiagnostics'
@@ -71,13 +72,14 @@ export function OnlineGameScreen({ audio, haptics, onBackHome }: OnlineGameScree
     gameId: string,
     version: number,
     lockedNumber: number | null,
+    source = 'CANONICAL_LIVE_TRANSITION',
   ) => {
     const key = presentationKey(gameId, version, 'SAFE')
     if (!ledgerRef.current.consume(key)) return
     traceOnlineConvergence({
       clientInstanceId: selfPlayerId,
       kind: 'PRESENTATION_CONSUMED',
-      source: 'CANONICAL_LIVE_TRANSITION',
+      source,
       gameVersion: version,
       phase: 'PLAYING_TURN',
       presentationKey: key,
@@ -98,6 +100,7 @@ export function OnlineGameScreen({ audio, haptics, onBackHome }: OnlineGameScree
     gameId: string,
     version: number,
     loserPlayerId: string | null,
+    source = 'CANONICAL_LIVE_TRANSITION',
   ) => {
     const key = presentationKey(gameId, version, 'BOOM')
     if (!ledgerRef.current.consume(key)) return
@@ -105,7 +108,7 @@ export function OnlineGameScreen({ audio, haptics, onBackHome }: OnlineGameScree
     traceOnlineConvergence({
       clientInstanceId: selfPlayerId,
       kind: 'PRESENTATION_CONSUMED',
-      source: 'CANONICAL_LIVE_TRANSITION',
+      source,
       gameVersion: version,
       phase: 'FINISHED',
       presentationKey: key,
@@ -180,29 +183,49 @@ export function OnlineGameScreen({ audio, haptics, onBackHome }: OnlineGameScree
 
     if (game.phase === 'RESOLVING') {
       audio.duckSoundscape()
-      if (isLiveTransition
-        && previous?.phase === 'PLAYING_TURN'
-        && ledgerRef.current.consume(presentationKey(game.id, game.version, 'LOCK'))
-      ) {
+      const key = presentationKey(game.id, game.version, 'LOCK')
+      const canPresentLock = isLiveTransition && previous?.phase === 'PLAYING_TURN'
+      const isFreshLock = isLivePresentationFresh('LOCK', game.updatedAt, session.clock.now())
+      if (canPresentLock && isFreshLock && ledgerRef.current.consume(key)) {
         traceOnlineConvergence({
           clientInstanceId,
           kind: 'PRESENTATION_CONSUMED',
           gameVersion: game.version,
           phase: game.phase,
-          presentationKey: presentationKey(game.id, game.version, 'LOCK'),
+          presentationKey: key,
         })
         audio.playLock(tension)
+      } else if (canPresentLock && !isFreshLock && ledgerRef.current.consume(key)) {
+        traceOnlineConvergence({
+          clientInstanceId,
+          kind: 'PRESENTATION_SKIPPED',
+          gameVersion: game.version,
+          phase: game.phase,
+          reason: 'RECOVERED_OUTSIDE_LIVE_WINDOW',
+          presentationKey: key,
+        })
       }
     } else if (game.phase === 'PLAYING_TURN') {
-      if (isLiveTransition
-        && previous?.phase === 'RESOLVING'
+      const key = presentationKey(game.id, game.version, 'SAFE')
+      const canPresentSafe = isLiveTransition
+        && previous?.phase !== 'FINISHED'
         && game.lastOutcome === 'SAFE'
-      ) {
+      const isFreshSafe = isLivePresentationFresh('SAFE', game.updatedAt, session.clock.now())
+      if (canPresentSafe && isFreshSafe) {
         presentSafe(
           game.id,
           game.version,
           game.lastLockedNumber,
         )
+      } else if (canPresentSafe && !isFreshSafe && ledgerRef.current.consume(key)) {
+        traceOnlineConvergence({
+          clientInstanceId,
+          kind: 'PRESENTATION_SKIPPED',
+          gameVersion: game.version,
+          phase: game.phase,
+          reason: 'RECOVERED_OUTSIDE_LIVE_WINDOW',
+          presentationKey: key,
+        })
       }
       if (game.lastOutcome === 'SAFE' && !isLiveTransition) {
         traceOnlineConvergence({
@@ -211,7 +234,7 @@ export function OnlineGameScreen({ audio, haptics, onBackHome }: OnlineGameScree
           gameVersion: game.version,
           phase: game.phase,
           reason: previous ? 'NOT_A_NEWER_LIVE_TRANSITION' : 'HYDRATED_SETTLED_STATE',
-          presentationKey: presentationKey(game.id, game.version, 'SAFE'),
+          presentationKey: key,
         })
       }
       if (!isSameGame || previous?.phase === 'FINISHED') {
@@ -220,14 +243,25 @@ export function OnlineGameScreen({ audio, haptics, onBackHome }: OnlineGameScree
       }
     } else if (game.phase === 'FINISHED') {
       audio.stopSoundscape()
-      if (isLiveTransition
-        && previous?.phase === 'RESOLVING'
-      ) {
+      const key = presentationKey(game.id, game.version, 'BOOM')
+      const canPresentBoom = isLiveTransition && previous?.phase !== 'FINISHED'
+      const isFreshBoom = isLivePresentationFresh('BOOM', game.updatedAt, session.clock.now())
+      if (canPresentBoom && isFreshBoom) {
         presentBoom(
           game.id,
           game.version,
           game.loserPlayerId,
         )
+      } else if (canPresentBoom && !isFreshBoom && ledgerRef.current.consume(key)) {
+        setLiveImpact(false)
+        traceOnlineConvergence({
+          clientInstanceId,
+          kind: 'PRESENTATION_SKIPPED',
+          gameVersion: game.version,
+          phase: game.phase,
+          reason: 'RECOVERED_OUTSIDE_LIVE_WINDOW',
+          presentationKey: key,
+        })
       }
     }
 
@@ -246,6 +280,7 @@ export function OnlineGameScreen({ audio, haptics, onBackHome }: OnlineGameScree
     presentBoom,
     presentSafe,
     selfPlayerId,
+    session.clock,
     snapshot.players.length,
     tension,
   ])
@@ -257,6 +292,31 @@ export function OnlineGameScreen({ audio, haptics, onBackHome }: OnlineGameScree
 
     for (const transition of eligibleTransitions) {
       const key = presentationKey(game.id, transition.version, transition.kind)
+      const canonicalTransitionIsCurrent = transition.version === game.version
+        && transition.phase === game.phase
+      const isFresh = isLivePresentationFresh(
+        transition.kind,
+        transition.updatedAt,
+        session.clock.now(),
+      )
+      if (!canonicalTransitionIsCurrent || !isFresh) {
+        if (ledgerRef.current.consume(key)) {
+          traceOnlineConvergence({
+            clientInstanceId: selfPlayerId,
+            kind: 'PRESENTATION_SKIPPED',
+            source: 'LIVE_POSTGRES_TRANSITION',
+            roomVersion: room.version,
+            gameVersion: transition.version,
+            playerCount: snapshot.players.length,
+            phase: transition.phase,
+            reason: canonicalTransitionIsCurrent
+              ? 'RECOVERED_OUTSIDE_LIVE_WINDOW'
+              : 'DUPLICATE_OR_OUT_OF_ORDER_AFTER_RECOVERY',
+            presentationKey: key,
+          })
+        }
+        continue
+      }
       if (transition.kind === 'LOCK') {
         if (!ledgerRef.current.consume(key)) continue
         traceOnlineConvergence({
@@ -276,22 +336,27 @@ export function OnlineGameScreen({ audio, haptics, onBackHome }: OnlineGameScree
           transition.gameId,
           transition.version,
           transition.lockedNumber,
+          'LIVE_POSTGRES_TRANSITION',
         )
       } else {
         presentBoom(
           transition.gameId,
           transition.version,
           transition.loserPlayerId,
+          'LIVE_POSTGRES_TRANSITION',
         )
       }
     }
   }, [
     audio,
     game.id,
+    game.phase,
+    game.version,
     room.version,
     presentBoom,
     presentSafe,
     selfPlayerId,
+    session.clock,
     session.liveGameTransitions,
     snapshot.players.length,
     tension,
@@ -340,16 +405,23 @@ export function OnlineGameScreen({ audio, haptics, onBackHome }: OnlineGameScree
   const loser = snapshot.players.find((player) => player.id === game.loserPlayerId)
   const resultVariant = game.loserPlayerId === selfPlayerId ? 'victim' : 'spectator'
   const resultPresentationKey = presentationKey(game.id, game.version, 'BOOM')
+  const resultIsWithinLiveWindow = isLivePresentationFresh(
+    'BOOM',
+    game.updatedAt,
+    session.clock.now(),
+  )
   const isNewLiveBoom = (
     previousGameRef.current?.id === game.id
     && previousGameRef.current.phase !== 'FINISHED'
     && game.phase === 'FINISHED'
     && game.version > previousGameRef.current.version
+    && resultIsWithinLiveWindow
   )
   const hasBufferedLiveBoom = session.liveGameTransitions.some((transition) => (
     transition.gameId === game.id
     && transition.version === game.version
     && transition.kind === 'BOOM'
+    && isLivePresentationFresh('BOOM', transition.updatedAt, session.clock.now())
   ))
   const isAwaitingLiveBoom = game.phase === 'FINISHED'
     && !ledgerRef.current.has(resultPresentationKey)
@@ -364,6 +436,7 @@ export function OnlineGameScreen({ audio, haptics, onBackHome }: OnlineGameScree
       className={`game-screen online-game-screen tension-${tension.level}${renderLiveImpact && resultVariant === 'victim' ? ' has-exploded' : ''}${renderLiveImpact && resultVariant === 'spectator' ? ' has-spectator-impact' : ''}`}
       data-tension={tension.level}
       data-online-phase={game.phase}
+      data-game-version={game.version}
     >
       <OnlineTopbar
         audio={audio}
