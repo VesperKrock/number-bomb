@@ -23,6 +23,7 @@ interface EventLossControl {
 }
 
 interface Diagnostic {
+  sequence?: number
   kind: string
   source?: string
   table?: string
@@ -83,6 +84,16 @@ async function readDiagnostics(page: Page): Promise<Diagnostic[]> {
   return page.evaluate(() => (
     window as ControlledWindow
   ).__BOM_SO_ONLINE_CONVERGENCE_DIAGNOSTICS__ ?? [])
+}
+
+async function injectDroppedChange(page: Page, change: DroppedChange): Promise<void> {
+  await page.evaluate((nextChange) => {
+    const control = (window as ControlledWindow).__BOM_SO_ONLINE_REALTIME_EVENT_LOSS__
+    if (typeof control?.inject !== 'function') {
+      throw new Error('Realtime event-loss injector is unavailable')
+    }
+    control.inject(nextChange)
+  }, change)
 }
 
 async function expectChannelSubscribed(page: Page): Promise<void> {
@@ -173,8 +184,16 @@ test.describe('deterministic missed-event anti-entropy', () => {
       { table: 'rooms' },
       { table: 'room_players' },
     ], true)
+    const beforeJoinDiagnostics = await readDiagnostics(host)
+    const joinStartSequence = beforeJoinDiagnostics.at(-1)?.sequence ?? 0
 
     await joinRoom(peer, roomCode, 'Silent Peer')
+    await injectDroppedChange(host, {
+      table: 'room_players',
+      eventType: 'INSERT',
+      new: { membership_status: 'ACTIVE' },
+      old: {},
+    })
     await expect(peer.getByTestId('online-roster-player')).toHaveCount(2)
     await expect(host.getByTestId('online-roster-player')).toHaveCount(2, { timeout: 2_000 })
 
@@ -182,7 +201,9 @@ test.describe('deterministic missed-event anti-entropy', () => {
     expect(dropped.some((change) => (
       change.table === 'rooms' || change.table === 'room_players'
     ))).toBe(true)
-    const diagnostics = await readDiagnostics(host)
+    const diagnostics = (await readDiagnostics(host)).filter(
+      (event) => (event.sequence ?? 0) > joinStartSequence,
+    )
     expect(diagnostics.some((event) => event.kind === 'ANTI_ENTROPY_APPLIED'
       && event.source === 'LOBBY'
       && event.playerCount === 2)).toBe(true)
@@ -191,6 +212,33 @@ test.describe('deterministic missed-event anti-entropy', () => {
       (event) => event.kind === 'POSTGRES_WAKE'
         && (event.table === 'rooms' || event.table === 'room_players'),
     )).toBe(false)
+
+    await setDropRules(host, [
+      { table: 'rooms' },
+      { table: 'room_players' },
+    ], true)
+    const beforeDepartureDiagnostics = await readDiagnostics(host)
+    const departureStartSequence = beforeDepartureDiagnostics.at(-1)?.sequence ?? 0
+    await peer.getByRole('button', { name: 'RỜI PHÒNG' }).click()
+    await injectDroppedChange(host, {
+      table: 'room_players',
+      eventType: 'UPDATE',
+      new: { membership_status: 'LEFT' },
+      old: { membership_status: 'ACTIVE' },
+    })
+    await expect(host.getByTestId('online-roster-player')).toHaveCount(1, { timeout: 2_000 })
+    await expect(host.getByTestId('online-room-activity')).toHaveText(
+      /Silent Peer ĐÃ RỜI PHÒNG\./u,
+    )
+    await expect(host.getByTestId('online-room-activity')).toHaveCount(1)
+    const departureDiagnostics = (await readDiagnostics(host)).filter(
+      (event) => (event.sequence ?? 0) > departureStartSequence,
+    )
+    expect(departureDiagnostics.some((event) => event.kind === 'ANTI_ENTROPY_APPLIED'
+      && event.source === 'LOBBY'
+      && event.playerCount === 2)).toBe(true)
+    expect(departureDiagnostics.some((event) => event.kind === 'POSTGRES_WAKE'
+      && (event.table === 'rooms' || event.table === 'room_players'))).toBe(false)
 
     await hostContext.close()
     await peerContext.close()

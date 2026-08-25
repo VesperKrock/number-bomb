@@ -3,6 +3,7 @@ import type { GameHapticsControls } from '../presentation/useGameHaptics'
 import { OnlineEntry } from './components/OnlineEntry'
 import { OnlineGameScreen } from './components/OnlineGameScreen'
 import { OnlineLobby } from './components/OnlineLobby'
+import { RoomActivityToasts } from './components/RoomActivityToasts'
 import { OnlineTopbar } from './components/OnlineTopbar'
 import { OnlineSessionProvider } from './store/OnlineSessionProvider'
 import { useOnlineSession } from './store/useOnlineSession'
@@ -55,10 +56,26 @@ function OnlineModeContent({ audio, haptics, onBackHome }: OnlineModeProps) {
   const room = session.snapshot?.room
   if (!room) return <OnlineEntry audio={audio} haptics={haptics} onBackHome={onBackHome} />
   if (room.status === 'LOBBY') {
-    return <OnlineLobby audio={audio} haptics={haptics} onBackHome={onBackHome} />
+    return (
+      <>
+        <OnlineLobby audio={audio} haptics={haptics} onBackHome={onBackHome} />
+        <RoomActivityToasts
+          activities={session.roomActivities}
+          onDismiss={session.dismissRoomActivity}
+        />
+      </>
+    )
   }
   if ((room.status === 'PLAYING' || room.status === 'FINISHED') && session.snapshot?.game) {
-    return <OnlineGameScreen audio={audio} haptics={haptics} onBackHome={onBackHome} />
+    return (
+      <>
+        <OnlineGameScreen audio={audio} haptics={haptics} onBackHome={onBackHome} />
+        <RoomActivityToasts
+          activities={session.roomActivities}
+          onDismiss={session.dismissRoomActivity}
+        />
+      </>
+    )
   }
 
   return <OnlineEntry audio={audio} haptics={haptics} onBackHome={onBackHome} />

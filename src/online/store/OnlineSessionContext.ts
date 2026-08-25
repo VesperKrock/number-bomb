@@ -7,6 +7,7 @@ import type {
   RealtimeSelectionEvent,
 } from '../types'
 import type { LiveGameTransition } from './liveGameTransition'
+import type { RoomActivity } from './roomActivity'
 
 export interface RemoteSelection {
   event: RealtimeSelectionEvent
@@ -23,6 +24,7 @@ export interface OnlineSessionValue {
   presencePlayerIds: ReadonlySet<string>
   remoteSelection: RemoteSelection | null
   liveGameTransitions: readonly LiveGameTransition[]
+  roomActivities: readonly RoomActivity[]
   clock: ServerClock
   createRoom: (nickname: string, settings: OnlineRoomSettings) => Promise<boolean>
   joinRoom: (roomCode: string, nickname: string) => Promise<boolean>
@@ -40,6 +42,7 @@ export interface OnlineSessionValue {
   refreshSnapshot: () => Promise<boolean>
   broadcastSelection: (candidate: number) => Promise<void>
   clearBroadcastSelection: () => Promise<void>
+  dismissRoomActivity: (activityId: string) => void
   clearLastCode: () => void
   exitOnlineRoomLocally: () => void
 }

@@ -43,6 +43,11 @@ import {
   parseRealtimeGameState,
   type LiveGameTransition,
 } from './liveGameTransition'
+import {
+  RoomActivityLedger,
+  type RoomActivity,
+  type RoomActivityObservationMode,
+} from './roomActivity'
 import { SnapshotConvergenceCoordinator } from './snapshotConvergence'
 import { reconcileCanonicalSnapshot } from './versionReducer'
 
@@ -92,6 +97,12 @@ export function OnlineSessionProvider({ children }: PropsWithChildren) {
     })
   }
   const snapshotCoordinator = snapshotCoordinatorRef.current
+  const roomActivityLedgerRef = useRef<RoomActivityLedger | null>(null)
+  if (roomActivityLedgerRef.current === null) {
+    roomActivityLedgerRef.current = new RoomActivityLedger()
+  }
+  const roomActivityLedger = roomActivityLedgerRef.current
+  const activityHydrationPendingRef = useRef(true)
   const [connection, setConnection] = useState<OnlineConnectionState>(
     config.available ? 'authenticating' : 'unavailable',
   )
@@ -101,13 +112,18 @@ export function OnlineSessionProvider({ children }: PropsWithChildren) {
   const [presencePlayerIds, setPresencePlayerIds] = useState<ReadonlySet<string>>(new Set())
   const [remoteSelection, setRemoteSelection] = useState<RemoteSelection | null>(null)
   const [liveGameTransitions, setLiveGameTransitions] = useState<readonly LiveGameTransition[]>([])
+  const [roomActivities, setRoomActivities] = useState<readonly RoomActivity[]>([])
   const activeRoomId = snapshot?.room?.id ?? null
   const activeGamePhase = snapshot?.game?.phase ?? null
 
-  const updateSnapshot = useCallback((result: OnlineRpcResult) => {
+  const updateSnapshot = useCallback((
+    result: OnlineRpcResult,
+    observationMode: RoomActivityObservationMode = 'LIVE',
+  ) => {
     if (!mountedRef.current) return
-    const reconciled = reconcileCanonicalSnapshot(snapshotRef.current, result)
-    if (reconciled === snapshotRef.current) {
+    const previous = snapshotRef.current
+    const reconciled = reconcileCanonicalSnapshot(previous, result)
+    if (reconciled === previous) {
       traceOnlineConvergence({
         clientInstanceId,
         kind: 'SNAPSHOT_IGNORED',
@@ -119,6 +135,18 @@ export function OnlineSessionProvider({ children }: PropsWithChildren) {
       })
       setLastCode(result.ok ? null : result.code)
       return
+    }
+    if (previous?.room?.id !== reconciled.room?.id) setRoomActivities([])
+    const effectiveObservationMode = observationMode === 'HYDRATE'
+      || activityHydrationPendingRef.current
+      ? 'HYDRATE'
+      : 'LIVE'
+    const observedActivities = roomActivityLedger.observe(
+      reconciled,
+      effectiveObservationMode,
+    )
+    if (observedActivities.length > 0) {
+      setRoomActivities((current) => [...current, ...observedActivities].slice(-3))
     }
     snapshotRef.current = reconciled
     traceOnlineConvergence({
@@ -139,7 +167,7 @@ export function OnlineSessionProvider({ children }: PropsWithChildren) {
     }
 
     if (TERMINAL_POINTER_CODES.has(result.code)) clearRoomPointer()
-  }, [clientInstanceId])
+  }, [clientInstanceId, roomActivityLedger])
 
   const applyRealtimeGameState = useCallback((row: Record<string, unknown>) => {
     const current = snapshotRef.current
@@ -176,6 +204,7 @@ export function OnlineSessionProvider({ children }: PropsWithChildren) {
   }, [])
 
   const removeRoomChannel = useCallback(() => {
+    activityHydrationPendingRef.current = true
     snapshotCoordinator.invalidate()
     const channel = channelRef.current
     channelRef.current = null
@@ -194,7 +223,10 @@ export function OnlineSessionProvider({ children }: PropsWithChildren) {
     }
   }, [snapshotCoordinator])
 
-  const refreshSnapshot = useCallback(async (reason = 'MANUAL'): Promise<boolean> => {
+  const refreshSnapshot = useCallback(async (
+    reason = 'MANUAL',
+    observationMode: RoomActivityObservationMode = 'LIVE',
+  ): Promise<boolean> => {
     if (!snapshotRef.current?.room || !clientRef.current) return false
     return snapshotCoordinator.request(reason, async ({
       generation,
@@ -241,7 +273,7 @@ export function OnlineSessionProvider({ children }: PropsWithChildren) {
         playerCount: result.players.length,
         phase: result.game?.phase ?? null,
       })
-      updateSnapshot(result)
+      updateSnapshot(result, observationMode)
       if (TERMINAL_POINTER_CODES.has(result.code)) {
         removeRoomChannel()
         setConnection('offline')
@@ -255,12 +287,13 @@ export function OnlineSessionProvider({ children }: PropsWithChildren) {
     client: SupabaseClient,
     roomId: string,
     source: string,
+    observationMode: RoomActivityObservationMode = 'LIVE',
   ): Promise<boolean> => {
     const sentAt = Date.now()
     const result = await onlineRpc.touch(client, roomId)
     recordRpcClock(result, sentAt, Date.now())
     if (snapshotRef.current?.room?.id !== roomId) return false
-    updateSnapshot(result)
+    updateSnapshot(result, observationMode)
     traceOnlineConvergence({
       clientInstanceId,
       kind: 'HEARTBEAT_RESPONSE_APPLIED',
@@ -538,11 +571,17 @@ export function OnlineSessionProvider({ children }: PropsWithChildren) {
           }
           void channel.track(payload)
           setConnection('connected')
-          void refreshSnapshot('CHANNEL_SUBSCRIBED')
-          void touchAndReconcile(client, room.id, 'CHANNEL_SUBSCRIBED')
+          void Promise.all([
+            refreshSnapshot('CHANNEL_SUBSCRIBED', 'HYDRATE'),
+            touchAndReconcile(client, room.id, 'CHANNEL_SUBSCRIBED', 'HYDRATE'),
+          ]).finally(() => {
+            if (channelRef.current === channel) activityHydrationPendingRef.current = false
+          })
         } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+          activityHydrationPendingRef.current = true
           setConnection('reconnecting')
         } else if (status === 'CLOSED') {
+          activityHydrationPendingRef.current = true
           setConnection('offline')
         }
       })
@@ -556,7 +595,7 @@ export function OnlineSessionProvider({ children }: PropsWithChildren) {
   ])
 
   const connectCanonicalResult = useCallback(async (result: OnlineRpcResult): Promise<boolean> => {
-    updateSnapshot(result)
+    updateSnapshot(result, 'HYDRATE')
     if (!isCanonicalResult(result)) return false
     await subscribeToRoom(result)
     return true
@@ -758,9 +797,11 @@ export function OnlineSessionProvider({ children }: PropsWithChildren) {
     clearRoomPointer()
     removeRoomChannel()
     snapshotRef.current = null
+    roomActivityLedger.reset()
+    setRoomActivities([])
     setSnapshot(null)
     setConnection('offline')
-  }, [removeRoomChannel, runRoomMutation])
+  }, [removeRoomChannel, roomActivityLedger, runRoomMutation])
 
   const claimHost = useCallback(() => runRoomMutation((client, current) =>
     onlineRpc.claimHost(
@@ -869,10 +910,16 @@ export function OnlineSessionProvider({ children }: PropsWithChildren) {
     clearRoomPointer()
     removeRoomChannel()
     snapshotRef.current = null
+    roomActivityLedger.reset()
+    setRoomActivities([])
     setSnapshot(null)
     setLastCode(null)
     setConnection(config.available ? 'offline' : 'unavailable')
-  }, [config.available, removeRoomChannel])
+  }, [config.available, removeRoomChannel, roomActivityLedger])
+
+  const dismissRoomActivity = useCallback((activityId: string) => {
+    setRoomActivities((current) => current.filter((activity) => activity.id !== activityId))
+  }, [])
 
   const value = useMemo<OnlineSessionValue>(() => ({
     available: config.available,
@@ -884,6 +931,7 @@ export function OnlineSessionProvider({ children }: PropsWithChildren) {
     presencePlayerIds,
     remoteSelection,
     liveGameTransitions,
+    roomActivities,
     clock: clockRef.current,
     createRoom,
     joinRoom,
@@ -901,6 +949,7 @@ export function OnlineSessionProvider({ children }: PropsWithChildren) {
     refreshSnapshot,
     broadcastSelection,
     clearBroadcastSelection,
+    dismissRoomActivity,
     clearLastCode: () => setLastCode(null),
     exitOnlineRoomLocally,
   }), [
@@ -912,6 +961,7 @@ export function OnlineSessionProvider({ children }: PropsWithChildren) {
     config.reason,
     connection,
     createRoom,
+    dismissRoomActivity,
     exitOnlineRoomLocally,
     finalizeResolution,
     joinRoom,
@@ -924,6 +974,7 @@ export function OnlineSessionProvider({ children }: PropsWithChildren) {
     reconnect,
     refreshSnapshot,
     remoteSelection,
+    roomActivities,
     resolveTimeout,
     restartGame,
     returnToLobby,

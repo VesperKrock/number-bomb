@@ -216,6 +216,154 @@ async function createOnlinePage(context: BrowserContext): Promise<Page> {
   return page
 }
 
+async function createLobbyRoom(page: Page, nickname: string): Promise<string> {
+  await page.getByLabel('BIỆT DANH').fill(nickname)
+  await page.getByRole('button', { name: 'TẠO PHÒNG', exact: true }).last().click()
+  await expect(page.getByRole('heading', { name: 'CHỜ NGƯỜI CHƠI' })).toBeVisible()
+  const roomCode = (await page.getByTestId('online-room-code').textContent())?.trim() ?? ''
+  expect(roomCode).toMatch(/^[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{5}$/u)
+  return roomCode
+}
+
+async function joinLobbyRoom(page: Page, roomCode: string, nickname: string): Promise<void> {
+  await page.goto(`/?room=${roomCode}`)
+  await page.getByLabel('BIỆT DANH').fill(nickname)
+  await page.getByRole('button', { name: 'THAM GIA PHÒNG' }).click()
+  await expect(page.getByRole('heading', { name: 'CHỜ NGƯỜI CHƠI' })).toBeVisible()
+}
+
+test('mobile lobby stays compact and keeps code/link copy actions independent', async ({ browser }) => {
+  const context = await browser.newContext({ viewport: { width: 390, height: 844 } })
+  await context.grantPermissions(['clipboard-read', 'clipboard-write'])
+  const host = await createOnlinePage(context)
+  const roomCode = await createLobbyRoom(host, 'Mobile Host')
+
+  const assertCompactLobby = async () => {
+    await expect(host.getByTestId('online-room-code')).toBeInViewport()
+    await expect(host.getByTestId('online-roster-player')).toBeInViewport()
+    await expect(host.getByRole('button', { name: 'BẮT ĐẦU ONLINE' })).toBeInViewport()
+    await expect(host.getByRole('button', { name: 'RỜI PHÒNG' })).toBeInViewport()
+    expect(await host.evaluate(() => ({
+      horizontalOverflow: document.documentElement.scrollWidth > window.innerWidth,
+      scrollHeight: document.documentElement.scrollHeight,
+      viewportHeight: window.innerHeight,
+      displayedEmptySeats: Array.from(document.querySelectorAll('.lobby-roster li.is-empty'))
+        .filter((element) => window.getComputedStyle(element).display !== 'none').length,
+    }))).toEqual({
+      horizontalOverflow: false,
+      scrollHeight: await host.evaluate(() => window.innerHeight),
+      viewportHeight: await host.evaluate(() => window.innerHeight),
+      displayedEmptySeats: 0,
+    })
+  }
+
+  await assertCompactLobby()
+  await host.setViewportSize({ width: 440, height: 956 })
+  await assertCompactLobby()
+
+  await host.getByRole('button', { name: 'SAO CHÉP MÃ' }).click()
+  await expect(host.getByText('ĐÃ SAO CHÉP MÃ.')).toBeVisible()
+  await expect.poll(() => host.evaluate(() => navigator.clipboard.readText())).toBe(roomCode)
+
+  await host.getByRole('button', { name: 'SAO CHÉP LINK' }).click()
+  await expect(host.getByText('ĐÃ SAO CHÉP LINK.')).toBeVisible()
+  const copiedLink = await host.evaluate(() => navigator.clipboard.readText())
+  const copiedUrl = new URL(copiedLink)
+  expect(copiedUrl.pathname).toBe('/number-bomb/')
+  expect(copiedUrl.searchParams.get('room')).toBe(roomCode)
+
+  await expect(host.locator('.room-qr')).toBeHidden()
+  await host.getByRole('button', { name: 'HIỆN QR' }).click()
+  await expect(host.locator('.room-qr')).toBeVisible()
+  await expect(host.locator('.lobby-settings-grid')).toBeHidden()
+  await host.getByRole('button', { name: 'MỞ / CHỈNH' }).click()
+  await expect(host.getByLabel('SỐ NGƯỜI TỐI ĐA')).toBeVisible()
+
+  await context.close()
+})
+
+test('canonical lobby leave notifies once and does not replay after hydration', async ({ browser }) => {
+  const hostContext = await browser.newContext()
+  const peerContext = await browser.newContext()
+  const host = await createOnlinePage(hostContext)
+  const roomCode = await createLobbyRoom(host, 'Đức Thắng')
+  const peer = await peerContext.newPage()
+  await joinLobbyRoom(peer, roomCode, 'Minh Quang')
+  await expect(host.getByTestId('online-roster-player')).toHaveCount(2)
+
+  await peer.getByRole('button', { name: 'RỜI PHÒNG' }).click()
+  await expect(host.getByTestId('online-roster-player')).toHaveCount(1)
+  await expect(host.getByTestId('online-room-activity')).toHaveText(/Minh Quang ĐÃ RỜI PHÒNG\./u)
+  await expect(host.getByTestId('online-room-activity')).toHaveCount(1)
+
+  await host.reload()
+  await expect(host.getByRole('heading', { name: 'CHỜ NGƯỜI CHƠI' })).toBeVisible()
+  await expect(host.getByTestId('online-roster-player')).toHaveCount(1)
+  await expect(host.getByTestId('online-room-activity')).toHaveCount(0)
+
+  await hostContext.close()
+  await peerContext.close()
+})
+
+test('canonical kick uses distinct activity copy', async ({ browser }) => {
+  const hostContext = await browser.newContext()
+  const peerContext = await browser.newContext()
+  const host = await createOnlinePage(hostContext)
+  const roomCode = await createLobbyRoom(host, 'Kick Host')
+  const peer = await peerContext.newPage()
+  await joinLobbyRoom(peer, roomCode, 'Lan Anh')
+  await expect(host.getByTestId('online-roster-player')).toHaveCount(2)
+
+  await host.getByRole('button', { name: 'MỜI RA' }).click()
+  await expect(host.getByTestId('online-roster-player')).toHaveCount(1)
+  await expect(host.getByTestId('online-room-activity')).toHaveText(
+    /Lan Anh ĐÃ BỊ MỜI RỜI PHÒNG\./u,
+  )
+  await expect(host.getByTestId('online-room-activity')).toHaveCount(1)
+
+  await hostContext.close()
+  await peerContext.close()
+})
+
+test('Presence disconnect never fabricates a leave activity', async ({ browser }) => {
+  const hostContext = await browser.newContext()
+  const peerContext = await browser.newContext()
+  const host = await createOnlinePage(hostContext)
+  const roomCode = await createLobbyRoom(host, 'Presence Host')
+  const peer = await peerContext.newPage()
+  await joinLobbyRoom(peer, roomCode, 'Transient Peer')
+  await expect(host.getByTestId('online-roster-player')).toHaveCount(2)
+
+  await peer.close()
+  await expect(host.getByTestId('online-roster-player').filter({ hasText: 'Transient Peer' })
+    .locator('.is-offline')).toBeVisible()
+  await expect(host.getByTestId('online-room-activity')).toHaveCount(0)
+
+  await hostContext.close()
+  await peerContext.close()
+})
+
+test('canonical leave activity remains available during gameplay', async ({ browser }) => {
+  const hostContext = await browser.newContext()
+  const peerContext = await browser.newContext()
+  const host = await createOnlinePage(hostContext)
+  const roomCode = await createLobbyRoom(host, 'Game Host')
+  const peer = await peerContext.newPage()
+  await joinLobbyRoom(peer, roomCode, 'Game Peer')
+  await expect(host.getByTestId('online-roster-player')).toHaveCount(2)
+  await host.getByRole('button', { name: 'BẮT ĐẦU ONLINE' }).click()
+  await expect(peer.getByTestId('number-board')).toBeVisible()
+
+  await peer.getByRole('button', { name: 'RỜI' }).click()
+  await expect(host.getByTestId('number-board')).toBeVisible()
+  await expect(host.getByTestId('online-room-activity')).toHaveText(
+    /Game Peer ĐÃ RỜI PHÒNG\./u,
+  )
+
+  await hostContext.close()
+  await peerContext.close()
+})
+
 test('two isolated devices synchronize lobby, SAFE, reconnect, and victim/spectator BOOM', async ({ browser }, testInfo) => {
   test.setTimeout(45_000)
   const hostContext = await browser.newContext({
