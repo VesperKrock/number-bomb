@@ -237,18 +237,20 @@ finish with `TIMEOUT_STRIKES_EXCEEDED`.
 
 Each connected member schedules an idempotent timeout RPC against the canonical
 deadline. Calls race safely; they do not decide the outcome. A single Supabase
-Cron job also calls `private.sweep_due_online_games(100)` every second as a
+Cron job also calls `private.sweep_due_online_games(100)` every 30 seconds as a
 backstop for background-tab throttling or all clients disconnecting. The sweep
 uses ordered batches and `FOR UPDATE SKIP LOCKED`; it resolves due turns and
 finalizes due presentations with the same private transactional helpers as the
 public RPC wrappers.
 
-The one-second Cron is not the normal 450–1000 ms presentation clock. Connected
+The 30-second Cron is not the normal 450–1000 ms presentation clock. Connected
 clients call `finalize_resolution` at `resolution_at`; Cron is recovery. If every
 client is gone, a late canonical result has no visible synchronization cost.
 
-Room cleanup runs as a separate hourly Cron job. Both jobs are database jobs;
-Online V1 does not need a permanent Node process or Edge Function.
+Room cleanup runs as a separate hourly Cron job. Cron history cleanup runs daily
+at 04:00 UTC and deletes `cron.job_run_details` rows whose `end_time` is older
+than 7 days. These are database jobs; Online V1 does not need a permanent Node
+process or Edge Function.
 
 ## 4. Authoritative state machine
 
@@ -1264,7 +1266,7 @@ Use isolated Browser A/B/C/D contexts and local Supabase reset per suite:
 | Risk | Mitigation/acceptance |
 |---|---|
 | Realtime packet duplication, ordering, or loss | Monotonic versions, idempotent RPCs, subscribe-then-snapshot bootstrap, snapshot on gaps |
-| Device clock skew/background throttling | sampled server offset; DB clock validation; all clients may race; one-second Cron backstop |
+| Device clock skew/background throttling | sampled server offset; DB clock validation; all clients may race; 30-second Cron backstop |
 | Outcome leak during suspense | private secret and private pending outcome; public row exposes only actor/number/time |
 | RLS recursion or overly broad definer | private boolean helper, empty search path, qualified names, exact execute grants, negative policy tests |
 | Five-character collision | 31-symbol space, unique constraint, eight server retries; no correctness reliance on probability |

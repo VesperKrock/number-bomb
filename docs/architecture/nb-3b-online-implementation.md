@@ -52,7 +52,7 @@ Canonical randomness uses rejection sampling over `gen_random_bytes`; SQL `rando
 
 The bomb, pending outcome, next bounds/actor and mutation records remain in the `private` schema. `room_players` exposes only safe columns: another player's Auth UID and `nickname_key` are neither granted nor published to Realtime.
 
-Cron runs the same private timeout/finalization engines used by public RPCs. It does not impersonate a player or create per-second database writes. Cleanup covers expired request records, expired room roots and old orphan anonymous Auth users while retaining users referenced by memberships.
+Cron runs the same private timeout/finalization engines used by public RPCs without impersonating a player. Forward migration `202610290001_fix_online_cron_retention.sql` sets the recovery sweep to every 30 seconds; connected clients still resolve timeouts and finalize at their canonical deadlines. Each Cron execution creates history, so a daily 04:00 UTC job deletes `cron.job_run_details` rows whose `end_time` is older than 7 days. The migration only schedules retention and does not delete existing history. The hourly expiry cleanup and weekly orphan anonymous-user cleanup remain unchanged, retaining users referenced by memberships.
 
 ## Frontend boundary
 
@@ -131,6 +131,6 @@ The checked-in Pages workflow already passes exactly those two browser-safe vari
 - Anonymous public rooms can be abused; configure Supabase Auth rate limits and CAPTCHA according to expected traffic.
 - Presence is deliberately advisory. Database membership, versions, deadlines and RPC validation remain authoritative when Presence is stale or spoofed.
 - Internet latency can exceed the ≤200 ms local/test result-onset target. Late clients present canonical results immediately and do not replay stale suspense.
-- Supabase plan/extension changes may affect one-second `pg_cron`; verify the installed jobs and monitor failures after hosted migration.
+- Supabase plan/extension changes may affect sub-minute `pg_cron`; verify the 30-second sweep and daily history retention jobs and monitor failures after hosted migration.
 
 No service-role key, database password, JWT secret or admin credential belongs in this repository or any `VITE_*` variable.
